@@ -1,0 +1,24 @@
+[package]
+name = "tickerterm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Low-latency terminal board for Binance USD-M futures market-wide streams"
+license = "MIT"
+repository = "https://github.com/chence08/tickerterm"
+readme = "README.md"
+keywords = ["binance", "futures", "terminal", "ticker", "websocket"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+libc = "0.2.191"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

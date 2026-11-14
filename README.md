@@ -1,0 +1,95 @@
+# tickerterm
+
+A low-latency terminal board for Binance USD-M futures. It shows every contract's 24h ticker in a dense grid, straight from the public market-wide WebSocket streams. No API key or account is needed; it only reads public market data.
+
+```
+ TICKERTERM binance usd-m | LIVE | 596 sym (94 tradfi) +46 -550 =0 | 24h vol 50.0B | USDT-PERP | sort VOL v (12s ago) | lvl 3 | pg 1/43
+ lat E->rx 77ms (min 31 avg 45 max 150) | rx->screen 310us (parse 262 draw 42 write 6, max 754) | 3.0 msg/s 260 KB/s 329 upd/s
+ UP AKE +86.0% SHELL +45.0% DODOX +18.2% | DN KAVA -44.3% BULLA -32.6% AGT -25.1%
+SYMBOL           LAST    24h%   QVOL TRADES L<->H    FUND%  SYMBOL           LAST    24h%   QVOL TRADES L<->H    FUND%
+BTC          66419.90   -4.13  12.7B  4.76M #----  +0.0034  SNDK        861.10000   -7.19  1.38B  2.86M #----  +0.0000
+ETH           1872.33   -4.72  8.47B  6.72M #----  +0.0038  SPCX        135.37000   -3.69  1.35B  1.36M #----  -0.0139
+SOXL         55.66000  -13.37  3.72B  4.40M -#---  +0.0000  XAU           3882.43   -0.18   773M   697K -#---  +0.0000
+ LIQ 14:12:18 BLESS SELL  23.8 @0.0091010 |
+```
+
+## Install
+
+**Prebuilt binary** (Linux x86_64 / arm64, macOS Apple Silicon): download the archive for your platform from the [latest release](https://github.com/chence08/tickerterm/releases/latest), then:
+
+```bash
+tar -xzf tickerterm-*.tar.gz
+./tickerterm
+```
+
+The Linux binaries are statically linked, so they run on any distribution.
+
+**With Cargo** (Rust 1.85 or newer):
+
+```bash
+cargo install --git https://github.com/chence08/tickerterm
+```
+
+**From source:**
+
+```bash
+git clone https://github.com/chence08/tickerterm
+cd tickerterm
+cargo build --release
+./target/release/tickerterm
+```
+
+## Usage
+
+```
+tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...]
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--all` | Start with every symbol, including COIN-M, USDC and dated contracts. The default is USDT perpetuals only. |
+| `--tradfi` | Start on the TradFi-only page (stocks, commodities, FX). `--crypto` is the opposite. |
+| `--rerank SECS` | Seconds between re-rankings. Default 60; `0` re-ranks only when you press `r`. |
+| `--url` | Use a different stream URL. |
+
+| Key | Action |
+| --- | --- |
+| `s` | Cycle sort: volume descending, 24h% descending, 24h% ascending |
+| `r` | Re-rank now |
+| `m` | Toggle USDT perpetuals / all symbols |
+| `t` | Cycle TradFi only / crypto only / both |
+| `1`–`4`, `a` | Detail level, or auto |
+| `/` | Filter by symbol (Esc clears) |
+| arrows, `j`/`k` | Page |
+| `?` | Toggle help / liquidation tape |
+| `q` | Quit |
+
+## What it shows
+
+- **Grid:** as many columns of symbols as the terminal fits. USDT perpetuals are shown without the `USDT` suffix. Auto detail never drops symbols for detail, but spends leftover width on richer cells.
+- **Detail levels:** last price and 24h %, then quote volume, then trade count, position in the 24h low–high range and funding rate, then high, low, VWAP, mark price and last quantity.
+- **Colour:** last price is green or red by tick direction and bold if it changed in the latest push. TradFi contracts are cyan.
+- **Header:** connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
+- **Footer:** recent liquidations.
+
+Row order is frozen between re-rankings so values update in place and rows stay readable. During the first 20 seconds after connecting the order still shifts, because the ticker stream only sends symbols that have changed.
+
+## Latency
+
+Binance pushes these streams once per second, which is the floor for any client. tickerterm keeps its own share small:
+
+- one thread and one socket, with no async runtime or TUI framework;
+- a redraw the moment a message arrives, with no frame timer;
+- only changed cells are redrawn, and each frame goes out in a single `write`.
+
+The header shows both the exchange-to-receive delay and the receive-to-screen time, which is typically a few hundred microseconds.
+
+## Data sources
+
+One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s` and `!forceOrder@arr`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls.
+
+This project is not affiliated with Binance. Nothing here is financial advice.
+
+## License
+
+MIT
