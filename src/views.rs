@@ -68,7 +68,11 @@ impl App {
             if pick || set.len() != want || self.plot_set_at.elapsed().as_secs() >= 60 {
                 pairs.clear();
                 pairs.extend(order.iter().map(|&s| (rows[s as usize].qvol, s)));
-                pairs.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                // pinned symbols first, then by volume
+                pairs.sort_unstable_by(|a, b| {
+                    let (pa, pb) = (rows[a.1 as usize].pinned, rows[b.1 as usize].pinned);
+                    pb.cmp(&pa).then(b.0.total_cmp(&a.0)).then(a.1.cmp(&b.1))
+                });
                 set.clear();
                 set.extend(pairs.iter().take(want).map(|p| p.1));
                 self.plot_set_at = std::time::Instant::now();
@@ -179,7 +183,7 @@ impl App {
             // ---- title
             let _ = write!(
                 lines[0],
-                "\x1b[0;1m 24h% HISTORY\x1b[0m | top {} of {} by volume | {} | range {} [{:+.2}% .. {:+.2}%] | {} samples, one per {}s",
+                "\x1b[0;1m 24h% HISTORY\x1b[0m | {} of {}: pinned, then top by volume | {} | range {} [{:+.2}% .. {:+.2}%] | {} samples, one per {}s",
                 set.len(),
                 order.len(),
                 if rebase { "CHANGE SINCE START" } else { "ABSOLUTE" },
@@ -257,7 +261,7 @@ impl App {
             l.extend_from_slice(b"  symbol     24h%\x1b[0m");
 
             lines[ch + 2].extend_from_slice(
-                b"\x1b[0;2m p/esc board | d distributions | x absolute/change since start | z p1-p99/full range | m t / filters apply | q quit\x1b[0m",
+                b"\x1b[0;2m p/esc board | d distributions | x absolute/change since start | z p1-p99/full range | F m t / filters apply | q quit\x1b[0m",
             );
         }
         self.vlines = lines;

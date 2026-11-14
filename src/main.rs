@@ -4,13 +4,15 @@
 //! poll(2) on {socket, stdin}; every message is parsed and the screen is redrawn
 //! immediately (no frame timer). Output is cell-diffed and sent in one write(2).
 
+mod favorites;
 mod funding;
 mod history;
 mod views;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
@@ -162,6 +164,7 @@ struct Row {
     at: Instant,
     /// funding interval in hours (from fundingInfo; 8 until known)
     fint: u8,
+    pinned: bool,
     tradfi: bool,
     usdt_perp: bool,
 }
@@ -200,8 +203,9 @@ fn ann(r: &Row) -> f64 {
     r.fund * 8760.0 / r.fint as f64
 }
 
-fn passes(r: &Row, market: u8, class: u8, filter: &str) -> bool {
+fn passes(r: &Row, market: u8, class: u8, pin_only: bool, filter: &str) -> bool {
     r.has_tick
+        && (!pin_only || r.pinned)
         && (market == 1 || (r.usdt_perp && r.st != 2))
         && (class == 0 || (class == 1) == r.tradfi)
         && (filter.is_empty() || r.sym.contains(filter))
@@ -259,6 +263,12 @@ struct App {
     live_since: Instant,
     rerank_secs: u64,
     in_rank: Vec<bool>,
+    // favourites
+    pins: HashSet<String>,
+    pin_only: bool,
+    pinning: bool,
+    pin_buf: Vec<u8>,
+    notice: String,
     // visualisations
     view: View,
     view_dirty: bool,
@@ -396,6 +406,11 @@ impl App {
             live_since: now,
             rerank_secs: 60,
             in_rank: Vec::new(),
+            pins: favorites::load(),
+            pin_only: false,
+            pinning: false,
+            pin_buf: Vec::new(),
+            notice: String::new(),
             view: View::Board,
             view_dirty: true,
             view_seq: 0,
@@ -471,6 +486,7 @@ impl App {
                     dir: 0,
                     seq: 0,
                     at: now,
+                    pinned: self.pins.contains(sym),
                     fint: self.fund_hours.get(sym).copied().unwrap_or(funding::DEFAULT_HOURS),
                     tradfi: false,
                     usdt_perp: sym.ends_with("USDT") && !sym.contains('_'),
@@ -480,6 +496,31 @@ impl App {
             }
         };
         &mut self.rows[i]
+    }
+
+    /// Pin or unpin each comma-separated name ("BTC", "btcusdt", "ETH,SOL") and save the list.
+    fn toggle_pins(&mut self, input: &str) {
+        self.notice.clear();
+        for name in input.split(',').map(|n| n.trim().to_uppercase()).filter(|n| !n.is_empty()) {
+            // accept the name as shown (USDT perpetuals drop the suffix) or the full symbol
+            let full = format!("{name}USDT");
+            let Some(&i) = self.index.get(&full).or_else(|| self.index.get(&name)) else {
+                let _ = write!(self.notice, "no symbol {name}  ");
+                continue;
+            };
+            let r = &mut self.rows[i];
+            r.pinned = !r.pinned;
+            if r.pinned {
+                self.pins.insert(r.sym.clone());
+            } else {
+                self.pins.remove(&r.sym);
+            }
+            let _ = write!(self.notice, "{} {}  ", if r.pinned { "pinned" } else { "unpinned" }, disp(r));
+        }
+        if let Err(e) = favorites::save(&self.pins) {
+            let _ = write!(self.notice, "(not saved: {e})");
+        }
+        self.rank_dirty = true;
     }
 
     /// Record the current 24h% of every symbol into the history ring.
@@ -615,12 +656,33 @@ impl App {
     /// Returns true to quit.
     fn on_keys(&mut self, b: &[u8]) -> bool {
         self.view_dirty = true;
+        self.notice.clear(); // a notice lasts until the next key
         let mut i = 0;
         while i < b.len() {
             let c = b[i];
             i += 1;
             if c == 3 {
                 return true;
+            }
+            if self.pinning {
+                match c {
+                    27 => {
+                        self.pinning = false;
+                        i = b.len();
+                    }
+                    13 | 10 => {
+                        self.pinning = false;
+                        let input = String::from_utf8_lossy(&self.pin_buf).into_owned();
+                        self.toggle_pins(&input);
+                    }
+                    127 | 8 => {
+                        // drop one whole character, which may be several bytes
+                        while self.pin_buf.pop().is_some_and(|x| x & 0xC0 == 0x80) {}
+                    }
+                    0x21..=0x7e | 0x80.. if self.pin_buf.len() < 64 => self.pin_buf.push(c.to_ascii_uppercase()),
+                    _ => {}
+                }
+                continue;
             }
             if self.filtering {
                 match c {
@@ -689,6 +751,15 @@ impl App {
                     self.rank_dirty = true;
                 }
                 b'/' => self.filtering = true,
+                b'f' => {
+                    self.pinning = true;
+                    self.pin_buf.clear();
+                }
+                b'F' => {
+                    self.pin_only = !self.pin_only;
+                    self.page = 0;
+                    self.rank_dirty = true;
+                }
                 b'?' | b'h' => self.help = !self.help,
                 b'p' => self.view = if self.view == View::Plot { View::Board } else { View::Plot },
                 b'd' => self.view = if self.view == View::Dist { View::Board } else { View::Dist },
@@ -711,8 +782,8 @@ impl App {
 
         // ---- membership + ranking. The order is frozen between re-ranks so rows hold still:
         // values update in place, positions only move on a re-rank.
-        let (market, class) = (self.market, self.class);
-        self.order.retain(|&i| passes(&self.rows[i as usize], market, class, &self.filter));
+        let (market, class, pin_only) = (self.market, self.class, self.pin_only);
+        self.order.retain(|&i| passes(&self.rows[i as usize], market, class, pin_only, &self.filter));
         self.in_rank.clear();
         self.in_rank.resize(self.rows.len(), false);
         for &i in &self.order {
@@ -720,7 +791,7 @@ impl App {
         }
         let mut grew = false;
         for (i, r) in self.rows.iter().enumerate() {
-            if !self.in_rank[i] && passes(r, market, class, &self.filter) {
+            if !self.in_rank[i] && passes(r, market, class, pin_only, &self.filter) {
                 self.order.push(i as u32);
                 grew = true;
             }
@@ -732,14 +803,15 @@ impl App {
             let key = SORTS[self.sort].0;
             self.order.sort_unstable_by(|&a, &b| {
                 let (x, y) = (&rows[a as usize], &rows[b as usize]);
-                match key {
+                // pinned symbols lead the page whatever the sort; the sort orders them among themselves
+                y.pinned.cmp(&x.pinned).then(match key {
                     Sort::Vol => y.qvol.total_cmp(&x.qvol),
                     Sort::ChgDesc => y.chg.total_cmp(&x.chg),
                     Sort::ChgAsc => x.chg.total_cmp(&y.chg),
                     // symbols with no funding rate yet go last either way
                     Sort::FundDesc => (y.has_fund, ann(y)).partial_cmp(&(x.has_fund, ann(x))).unwrap(),
                     Sort::FundAsc => (y.has_fund, ann(x)).partial_cmp(&(x.has_fund, ann(y))).unwrap(),
-                }
+                })
                 .then_with(|| x.sym.cmp(&y.sym))
             });
             self.rank_dirty = false;
@@ -793,9 +865,24 @@ impl App {
         // ---- line 1: status
         let s = &mut self.scratch;
         s.clear();
+        // Prompts and active filters go first, where a narrow terminal cannot cut them off.
+        s.extend_from_slice(b"\x1b[0;1m TICKERTERM\x1b[0m");
+        if self.pinning {
+            s.extend_from_slice(b" | \x1b[1;33mpin/unpin: ");
+            s.extend_from_slice(&self.pin_buf);
+            s.extend_from_slice(b"_\x1b[0m");
+        } else if !self.notice.is_empty() {
+            let _ = write!(s, " | \x1b[1;33m{}\x1b[0m", self.notice.trim_end());
+        }
+        if self.filtering || !self.filter.is_empty() {
+            let _ = write!(s, " | \x1b[1;33m/{}{}\x1b[0m", self.filter, if self.filtering { "_" } else { "" });
+        }
+        if self.pin_only {
+            s.extend_from_slice(b" | \x1b[1;33m* PINNED ONLY\x1b[0m");
+        }
         let _ = write!(
             s,
-            "\x1b[0;1m TICKERTERM\x1b[0m binance usd-m | {}{}\x1b[0m | {} sym (\x1b[36m{} tradfi\x1b[0m) \x1b[32m+{}\x1b[0m \x1b[31m-{}\x1b[0m ={} | 24h vol ",
+            " | {}{}\x1b[0m | {} sym (\x1b[36m{} tradfi\x1b[0m) \x1b[32m+{}\x1b[0m \x1b[31m-{}\x1b[0m ={} | 24h vol ",
             if self.live { "\x1b[1;32m" } else { "\x1b[1;33m" },
             self.status,
             n,
@@ -817,9 +904,6 @@ impl App {
             self.page + 1,
             pages
         );
-        if self.filtering || !self.filter.is_empty() {
-            let _ = write!(s, " | \x1b[1;33m/{}{}\x1b[0m", self.filter, if self.filtering { "_" } else { "" });
-        }
         emit(&mut self.out, &mut self.prev[0], s, 1, 1, true);
 
         // ---- line 2: latency + throughput
@@ -973,7 +1057,7 @@ impl App {
         s.clear();
         if self.help || self.liqs.is_empty() {
             s.extend_from_slice(
-                b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | p plot | d distributions | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
+                b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | f pin/unpin | F pinned only | p plot | d distributions | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
             );
         } else {
             s.extend_from_slice(b"\x1b[0;1m LIQ\x1b[0m");
@@ -1057,6 +1141,16 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
     });
     // pad by terminal columns: CJK tickers are two columns per character
     let mut used = 0;
+    if r.pinned {
+        s.extend_from_slice(if stale { b"\x1b[0;2;33m*" } else { b"\x1b[0;1;33m*" });
+        s.extend_from_slice(match (stale, r.tradfi) {
+            (true, true) => b"\x1b[0;2;36m" as &[u8],
+            (true, false) => b"\x1b[0;2m",
+            (false, true) => b"\x1b[0;1;36m",
+            _ => b"\x1b[0;1m",
+        });
+        used = 1;
+    }
     for ch in disp(r).chars() {
         let cwid = wide(ch);
         if used + cwid > sw {
