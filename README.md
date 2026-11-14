@@ -3,14 +3,17 @@
 A low-latency terminal board for Binance USD-M futures. It shows every contract's 24h ticker in a dense grid, straight from the public market-wide WebSocket streams. No API key or account is needed; it only reads public market data.
 
 ```
- TICKERTERM binance usd-m | LIVE | 596 sym (94 tradfi) +46 -550 =0 | 24h vol 50.0B | USDT-PERP | sort VOL v (12s ago) | lvl 3 | pg 1/43
- lat E->rx 77ms (min 31 avg 45 max 150) | rx->screen 310us (parse 262 draw 42 write 6, max 754) | 3.0 msg/s 260 KB/s 329 upd/s
- UP AKE +86.0% SHELL +45.0% DODOX +18.2% | DN KAVA -44.3% BULLA -32.6% AGT -25.1%
-SYMBOL           LAST    24h%   QVOL TRADES L<->H    FUND%  SYMBOL           LAST    24h%   QVOL TRADES L<->H    FUND%
-BTC          66419.90   -4.13  12.7B  4.76M #----  +0.0034  SNDK        861.10000   -7.19  1.38B  2.86M #----  +0.0000
-ETH           1872.33   -4.72  8.47B  6.72M #----  +0.0038  SPCX        135.37000   -3.69  1.35B  1.36M #----  -0.0139
-SOXL         55.66000  -13.37  3.72B  4.40M -#---  +0.0000  XAU           3882.43   -0.18   773M   697K -#---  +0.0000
- LIQ 14:12:18 BLESS SELL  23.8 @0.0091010 |
+ TICKERTERM binance usd-m | LIVE | 657 sym (135 tradfi) +83 -572 =2 | 24h vol 47.0B | USDT-PERP | sort VOL v (2s ago) | lvl 2 | pg 1/44
+ lat E->rx 46ms (min 32 avg 49 max 190) | rx->screen 77us (parse 12 draw 62 write 2, max 777) | 11.0 msg/s 222 KB/s 195 upd/s | up 00:01
+ UP EVAA +68.4% AKE +66.0% | DN KAVA -54.9% BULLA -30.2%
+ TRADFI US CLOSED 33h45m | CMDTY CLOSED 31h45m | FX CLOSED 30h45m | KR CLOSED 32h45m | HK CLOSED 34h15m | CN CLOSED 34h15m |
+SYMBOL           MARK    24h%    FUND%  NEXT  SYMBOL           MARK    24h%    FUND%  NEXT  SYMBOL           MARK    24h%    FUND%  NEXT
+BTC          65614.50   -4.57  +0.0035   45m  AKE         0.0125109  +65.97  +0.0050   45m  HYPE         67.31800   -8.09  +0.0006   45m
+ETH           1842.99   -4.96  +0.0012   45m  NVDA        161.10697   +0.16  -0.0433   45m  XAU           3876.01   -0.53  +0.0000   45m
+SOXL         55.98000   +1.05  +0.0000   45m  SNDK        861.45000   +0.22  +0.0000   45m  SOXS         52.89000   -0.15  +0.0000   45m
+SOL           74.0000   -7.52  -0.0031   45m  SPCX        135.37833   -1.91  -0.0014   45m  BNB           597.842   -5.87  +0.0000   45m
+ZEC            883.59   -6.85  +0.0078   45m  XRP            0.9817   -4.54  +0.0025   45m  MU          763.33678   +0.14  +0.0000   45m
+ LIQ 15:14:41 CRCL SELL   744 @59.39000 | 15:14:40 MSTR SELL 3.54K @104.23000 | 15:14:33 INIT SELL  29.6 @0.0967217 |
 ```
 
 ## Install
