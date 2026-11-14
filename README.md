@@ -58,7 +58,7 @@ tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...]
 | `r` | Re-rank now |
 | `m` | Toggle USDT perpetuals / all symbols |
 | `t` | Cycle TradFi only / crypto only / both |
-| `1`–`4`, `a` | Detail level, or auto |
+| `1`–`5`, `a` | Detail level, or auto |
 | `/` | Filter by symbol (Esc clears) |
 | arrows, `j`/`k` | Page |
 | `?` | Toggle help / liquidation tape |
@@ -67,9 +67,10 @@ tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...]
 ## What it shows
 
 - **Grid:** as many columns of symbols as the terminal fits. USDT perpetuals are shown without the `USDT` suffix. Auto detail never drops symbols for detail, but spends leftover width on richer cells.
-- **Detail levels:** last price and 24h %, then quote volume, then trade count, position in the 24h low–high range and funding rate, then high, low, VWAP, mark price and last quantity.
-- **Colour:** last price is green or red by tick direction and bold if it changed in the latest push. TradFi contracts are cyan.
+- **Detail levels (`1`–`5`):** mark price and 24h %, then funding rate and time to the next funding, then quote volume, then trade count and position in the 24h low–high range, then high, low, VWAP, last price and last quantity.
+- **Colour:** 24h % and funding rate are green or red by sign. Mark price is drawn plain, since it moves every second for every symbol. TradFi contracts are cyan.
 - **Header:** connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
+- **TradFi sessions:** whether each underlying market (US equities, commodities, FX, Korea, Hong Kong, China) is open, in pre/post-market, overnight or closed, with the time left in that state.
 - **Footer:** recent liquidations.
 
 Row order is frozen between re-rankings so values update in place and rows stay readable. During the first 20 seconds after connecting the order still shifts, because the ticker stream only sends symbols that have changed.
@@ -86,7 +87,7 @@ The header shows both the exchange-to-receive delay and the receive-to-screen ti
 
 ## Data sources
 
-One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s` and `!forceOrder@arr`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls.
+One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s`, `!forceOrder@arr` and `tradingSession`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls.
 
 This project is not affiliated with Binance. Nothing here is financial advice.
 

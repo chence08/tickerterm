@@ -16,7 +16,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 const DEFAULT_URL: &str =
-    "wss://fstream.binance.com/market/stream?streams=!ticker@arr/!markPrice@arr@1s/!forceOrder@arr";
+    "wss://fstream.binance.com/market/stream?streams=!ticker@arr/!markPrice@arr@1s/!forceOrder@arr/tradingSession";
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 static WINCH: AtomicBool = AtomicBool::new(false);
@@ -75,6 +75,8 @@ struct Mark<'a> {
     p: &'a str,
     #[serde(borrow, default)]
     r: &'a str,
+    #[serde(rename = "T", default)]
+    next: u64,
 }
 
 #[derive(Deserialize)]
@@ -101,7 +103,36 @@ struct ForceOrder<'a> {
     t: u64,
 }
 
+#[derive(Deserialize)]
+struct Session<'a> {
+    #[serde(borrow)]
+    e: &'a str,
+    #[serde(rename = "E", default)]
+    ev: u64,
+    #[serde(rename = "T", default)]
+    end: u64,
+    #[serde(rename = "S", borrow, default)]
+    state: &'a str,
+}
+
 // ---------------------------------------------------------------- state
+
+/// Underlying-market session for TradFi contracts (from the `tradingSession` stream).
+struct Sess {
+    key: String,
+    rank: usize,
+    state: String,
+    end: u64,
+}
+const MARKETS: [(&str, &str); 6] = [
+    ("EquityUpdate", "US"),
+    ("CommodityUpdate", "CMDTY"),
+    ("FXUpdate", "FX"),
+    ("KR_EquityUpdate", "KR"),
+    ("HK_EquityUpdate", "HK"),
+    ("CN_EquityUpdate", "CN"),
+];
+
 
 struct Row {
     sym: String,
@@ -120,6 +151,7 @@ struct Row {
     mark_s: String,
     fund: f64,
     has_fund: bool,
+    next_fund: u64,
     has_tick: bool,
     dir: i8,
     seq: u64,
@@ -157,9 +189,9 @@ fn passes(r: &Row, market: u8, class: u8, filter: &str) -> bool {
 }
 
 /// Visible cell width per detail level (without the 2-char gutter).
-const CW: [usize; 4] = [33, 40, 62, 113];
-const HDR_LINES: usize = 4; // 3 status lines + column header
-const FIXED: usize = 5; // + footer
+const CW: [usize; 5] = [33, 48, 55, 68, 119];
+const HDR_LINES: usize = 5; // 3 status lines + sessions + column header
+const FIXED: usize = 6; // + footer
 
 #[derive(Default)]
 struct Stat {
@@ -189,6 +221,7 @@ struct App {
     rows: Vec<Row>,
     index: HashMap<String, usize>,
     liqs: VecDeque<Liq>,
+    sessions: Vec<Sess>,
     tseq: u64,
     // view
     sort: usize,
@@ -309,6 +342,7 @@ impl App {
             rows: Vec::with_capacity(1024),
             index: HashMap::with_capacity(1024),
             liqs: VecDeque::new(),
+            sessions: Vec::new(),
             tseq: 0,
             sort: 0,
             level: None,
@@ -372,6 +406,7 @@ impl App {
                     mark_s: String::new(),
                     fund: 0.0,
                     has_fund: false,
+                    next_fund: 0,
                     has_tick: false,
                     dir: 0,
                     seq: 0,
@@ -440,6 +475,21 @@ impl App {
                 if !m.r.is_empty() {
                     r.fund = pf(m.r) * 100.0;
                     r.has_fund = true;
+                }
+                r.next_fund = m.next;
+            }
+        } else if stream == "tradingSession" {
+            let m: Session = serde_json::from_str(data)?;
+            ev = m.ev;
+            match self.sessions.iter_mut().find(|x| x.key == m.e) {
+                Some(x) => {
+                    set(&mut x.state, m.state);
+                    x.end = m.end;
+                }
+                None => {
+                    let rank = MARKETS.iter().position(|k| k.0 == m.e).unwrap_or(MARKETS.len());
+                    self.sessions.push(Sess { key: m.e.to_string(), rank, state: m.state.to_string(), end: m.end });
+                    self.sessions.sort_by_key(|x| x.rank);
                 }
             }
         } else if stream.starts_with("!forceOrder") {
@@ -535,7 +585,7 @@ impl App {
                     self.page = 0;
                     self.rank_dirty = true;
                 }
-                b'1'..=b'4' => self.level = Some((c - b'1') as usize),
+                b'1'..=b'5' => self.level = Some((c - b'1') as usize),
                 b'a' | b'0' => self.level = None,
                 b'm' => {
                     self.market ^= 1;
@@ -616,7 +666,7 @@ impl App {
         let level = self.level.unwrap_or_else(|| {
             // never give up symbols for detail, but spend leftover width on richer cells
             let want = n.min(ncols_at(0) * grid_rows);
-            (0..4).rev().find(|&l| ncols_at(l) * grid_rows >= want && cw(l) <= w).unwrap_or(0)
+            (0..CW.len()).rev().find(|&l| ncols_at(l) * grid_rows >= want && cw(l) <= w).unwrap_or(0)
         });
         let ncols = ncols_at(level);
         let slots = ncols * grid_rows;
@@ -712,26 +762,59 @@ impl App {
         }
         emit(&mut self.out, &mut self.prev[2], s, 3, 1, true);
 
-        // ---- line 4: column headers
+        // ---- line 4: TradFi market sessions, with time left in the current state
+        s.clear();
+        s.extend_from_slice(b"\x1b[0;36m TRADFI\x1b[0m");
+        if self.sessions.is_empty() {
+            s.extend_from_slice(b"\x1b[2m sessions: waiting\x1b[0m");
+        }
+        let wall = now_ms();
+        for x in &self.sessions {
+            let label = MARKETS.get(x.rank).map(|k| k.1).unwrap_or_else(|| x.key.trim_end_matches("Update"));
+            let (col, st) = match x.state.as_str() {
+                "REGULAR" => ("\x1b[1;32m", "OPEN"),
+                "PRE_MARKET" => ("\x1b[33m", "PRE"),
+                "AFTER_MARKET" => ("\x1b[33m", "POST"),
+                "OVERNIGHT" => ("\x1b[35m", "OVERNIGHT"),
+                "NO_TRADING" => ("\x1b[31m", "CLOSED"),
+                other => ("\x1b[0m", other),
+            };
+            let _ = write!(s, " {} {}{}\x1b[0m", label, col, st);
+            let left = x.end.saturating_sub(wall) / 1000;
+            if left >= 3600 {
+                let _ = write!(s, " {}h{:02}m", left / 3600, (left / 60) % 60);
+            } else if left >= 60 {
+                let _ = write!(s, " {}m", left / 60);
+            } else if left > 0 {
+                let _ = write!(s, " {}s", left);
+            }
+            s.extend_from_slice(b" |");
+        }
+        emit(&mut self.out, &mut self.prev[FIXED - 1], s, 4, 1, true);
+
+        // ---- line 5: column headers
         s.clear();
         s.extend_from_slice(b"\x1b[0;7m");
         for c in 0..ncols {
-            let _ = write!(s, "{:<sw$} {:>10} {:>7}", "SYMBOL", "LAST", "24h%");
+            let _ = write!(s, "{:<sw$} {:>10} {:>7}", "SYMBOL", "MARK", "24h%");
             if level >= 1 {
-                let _ = write!(s, " {:>6}", "QVOL");
+                let _ = write!(s, " {:>8} {:>5}", "FUND%", "NEXT");
             }
             if level >= 2 {
-                let _ = write!(s, " {:>6} {:5} {:>8}", "TRADES", "L<->H", "FUND%");
+                let _ = write!(s, " {:>6}", "QVOL");
             }
             if level >= 3 {
-                let _ = write!(s, " {:>10} {:>10} {:>10} {:>10} {:>6}", "HIGH", "LOW", "VWAP", "MARK", "LQTY");
+                let _ = write!(s, " {:>6} {:5}", "TRADES", "L<->H");
+            }
+            if level >= 4 {
+                let _ = write!(s, " {:>10} {:>10} {:>10} {:>10} {:>6}", "HIGH", "LOW", "VWAP", "LAST", "LQTY");
             }
             if c + 1 < ncols {
                 s.extend_from_slice(b"  ");
             }
         }
         s.extend_from_slice(b"\x1b[0m");
-        emit(&mut self.out, &mut self.prev[3], s, 4, 1, true);
+        emit(&mut self.out, &mut self.prev[3], s, HDR_LINES, 1, true);
 
         // ---- grid (column-major)
         let base = self.page * slots;
@@ -742,7 +825,7 @@ impl App {
             match self.order.get(base + slot) {
                 Some(&i) => {
                     let r = &self.rows[i as usize];
-                    cell(s, r, level, sw, r.seq == self.tseq, now.duration_since(r.at).as_secs() > 60);
+                    cell(s, r, level, sw, wall, now.duration_since(r.at).as_secs() > 60);
                 }
                 None => {
                     s.extend_from_slice(b"\x1b[0m");
@@ -758,7 +841,7 @@ impl App {
         s.clear();
         if self.help || self.liqs.is_empty() {
             s.extend_from_slice(
-                b"\x1b[0;2m q quit | s sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | 1-4 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
+                b"\x1b[0;2m q quit | s sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
             );
         } else {
             s.extend_from_slice(b"\x1b[0;1m LIQ\x1b[0m");
@@ -800,10 +883,11 @@ fn emit(out: &mut Vec<u8>, prev: &mut Vec<u8>, new: &[u8], row: usize, col: usiz
         return;
     }
     let _ = write!(out, "\x1b[{};{}H", row, col);
-    out.extend_from_slice(new);
     if eol {
+        // clear first: clearing after a line that exactly fills the width would eat its last column
         out.extend_from_slice(b"\x1b[0m\x1b[K");
     }
+    out.extend_from_slice(new);
     prev.clear();
     prev.extend_from_slice(new);
 }
@@ -817,24 +901,26 @@ fn wide(c: char) -> usize {
     1 + w as usize
 }
 
-fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: bool) {
-    let sgr = |s: &mut Vec<u8>, sign: f64, bold: bool| {
-        s.extend_from_slice(match (stale, bold, sign > 0.0, sign < 0.0) {
-            (true, ..) => b"\x1b[0;2m",
-            (_, true, true, _) => b"\x1b[0;1;92m",
-            (_, true, _, true) => b"\x1b[0;1;91m",
-            (_, false, true, _) => b"\x1b[0;32m",
-            (_, false, _, true) => b"\x1b[0;31m",
-            (_, true, ..) => b"\x1b[0;1m",
+/// Mark prices arrive with 8 decimals; show them at the same precision as the traded price.
+fn mark_disp<'a>(mark: &'a str, last: &str) -> &'a str {
+    let (Some(p), false) = (mark.find('.'), last.is_empty()) else { return mark };
+    let d = last.find('.').map(|q| last.len() - q - 1).unwrap_or(0);
+    &mark[..if d == 0 { p } else { (p + 1 + d).min(mark.len()) }]
+}
+
+fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: bool) {
+    let sgr = |s: &mut Vec<u8>, sign: f64, _bold: bool| {
+        s.extend_from_slice(match (stale, sign > 0.0, sign < 0.0) {
+            (true, ..) => b"\x1b[0;2m" as &[u8],
+            (_, true, _) => b"\x1b[0;32m",
+            (_, _, true) => b"\x1b[0;31m",
             _ => b"\x1b[0m",
         })
     };
-    s.extend_from_slice(match (stale, r.tradfi, fresh) {
-        (true, true, _) => b"\x1b[0;2;36m" as &[u8],
-        (true, ..) => b"\x1b[0;2m",
-        (_, true, true) => b"\x1b[0;1;36m",
-        (_, true, false) => b"\x1b[0;36m",
-        (_, false, true) => b"\x1b[0;1m",
+    s.extend_from_slice(match (stale, r.tradfi) {
+        (true, true) => b"\x1b[0;2;36m" as &[u8],
+        (true, false) => b"\x1b[0;2m",
+        (false, true) => b"\x1b[0;36m",
         _ => b"\x1b[0m",
     });
     // pad by terminal columns: CJK tickers are two columns per character
@@ -849,8 +935,11 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: b
         s.extend_from_slice(ch.encode_utf8(&mut u).as_bytes());
     }
     s.resize(s.len() + sw - used + 1, b' ');
-    sgr(s, r.dir as f64, fresh);
-    price(s, &r.last_s, r.last, 10);
+    // Mark price, cut to the contract's tick precision and drawn plain: it moves every second
+    // for every symbol, so colouring or bolding it would make the whole board flicker.
+    s.extend_from_slice(if stale { b"\x1b[0;2m" } else { b"\x1b[0m" });
+    let mark = mark_disp(&r.mark_s, &r.last_s);
+    price(s, mark, pf(mark), 10);
     sgr(s, r.chg, false);
     // at most 6 chars, so there is always a gap after the price
     let a = r.chg.abs();
@@ -861,11 +950,40 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: b
     } else {
         write!(s, " {:>+7.0}", r.chg.clamp(-99999.0, 99999.0))
     };
+    let plain: &[u8] = if stale { b"\x1b[0;2m " } else { b"\x1b[0m " };
     if level >= 1 {
-        s.extend_from_slice(if stale { b"\x1b[0;2m " } else { b"\x1b[0m " });
-        hum(s, r.qvol, 6);
+        if r.has_fund {
+            sgr(s, r.fund, false);
+            let _ = write!(s, " {:>+8.4}", r.fund);
+        } else {
+            s.extend_from_slice(b"        -");
+        }
+        s.extend_from_slice(plain);
+        // time until the next funding settlement
+        let left = r.next_fund.saturating_sub(wall) / 1000;
+        let mut tmp = [0u8; 16];
+        let mut c = std::io::Cursor::new(&mut tmp[..]);
+        let _ = if r.next_fund == 0 {
+            write!(c, "-")
+        } else if left >= 360_000 {
+            write!(c, "{}d", left / 86400)
+        } else if left >= 3600 {
+            write!(c, "{}h{:02}m", left / 3600, (left / 60) % 60)
+        } else if left >= 60 {
+            // whole minutes only, so the column is not ticking every second
+            write!(c, "{}m", left / 60)
+        } else {
+            write!(c, "{}s", left)
+        };
+        let n = c.position() as usize;
+        s.resize(s.len() + 5usize.saturating_sub(n), b' ');
+        s.extend_from_slice(&tmp[..n]);
     }
     if level >= 2 {
+        s.extend_from_slice(plain);
+        hum(s, r.qvol, 6);
+    }
+    if level >= 3 {
         s.push(b' ');
         hum(s, r.trades as f64, 6);
         s.push(b' ');
@@ -873,22 +991,16 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: b
         for i in 0..5 {
             s.push(if i == pos.min(4) { b'#' } else { b'-' });
         }
-        if r.has_fund {
-            sgr(s, r.fund, false);
-            let _ = write!(s, " {:>+8.4}", r.fund);
-        } else {
-            s.extend_from_slice(b"        -");
-        }
     }
-    if level >= 3 {
-        s.extend_from_slice(if stale { b"\x1b[0;2m " } else { b"\x1b[0m " });
+    if level >= 4 {
+        s.push(b' ');
         price(s, &r.high_s, r.high, 10);
         s.push(b' ');
         price(s, &r.low_s, r.low, 10);
         s.push(b' ');
         price(s, &r.vwap_s, pf(&r.vwap_s), 10);
         s.push(b' ');
-        price(s, &r.mark_s, pf(&r.mark_s), 10);
+        price(s, &r.last_s, r.last, 10);
         s.push(b' ');
         hum(s, r.lqty, 6);
     }
