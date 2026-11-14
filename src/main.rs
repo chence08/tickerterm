@@ -765,7 +765,7 @@ impl App {
             let mut used = 4;
             for l in &self.liqs {
                 let sym = l.sym.strip_suffix("USDT").unwrap_or(&l.sym);
-                let need = 9 + sym.len() + 6 + 6 + l.price.len() + 5;
+                let need = 9 + sym.chars().map(wide).sum::<usize>() + 6 + 6 + l.price.len() + 5;
                 if used + need > w {
                     break;
                 }
@@ -808,6 +808,15 @@ fn emit(out: &mut Vec<u8>, prev: &mut Vec<u8>, new: &[u8], row: usize, col: usiz
     prev.extend_from_slice(new);
 }
 
+/// Terminal columns taken by a character (2 for CJK / fullwidth / emoji, else 1).
+fn wide(c: char) -> usize {
+    let c = c as u32;
+    let w = matches!(c,
+        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD);
+    1 + w as usize
+}
+
 fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: bool) {
     let sgr = |s: &mut Vec<u8>, sign: f64, bold: bool| {
         s.extend_from_slice(match (stale, bold, sign > 0.0, sign < 0.0) {
@@ -828,7 +837,18 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, fresh: bool, stale: b
         (_, false, true) => b"\x1b[0;1m",
         _ => b"\x1b[0m",
     });
-    let _ = write!(s, "{:<sw$.sw$} ", disp(r));
+    // pad by terminal columns: CJK tickers are two columns per character
+    let mut used = 0;
+    for ch in disp(r).chars() {
+        let cwid = wide(ch);
+        if used + cwid > sw {
+            break;
+        }
+        used += cwid;
+        let mut u = [0u8; 4];
+        s.extend_from_slice(ch.encode_utf8(&mut u).as_bytes());
+    }
+    s.resize(s.len() + sw - used + 1, b' ');
     sgr(s, r.dir as f64, fresh);
     price(s, &r.last_s, r.last, 10);
     sgr(s, r.chg, false);
