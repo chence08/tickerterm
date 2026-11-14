@@ -4,6 +4,10 @@
 //! poll(2) on {socket, stdin}; every message is parsed and the screen is redrawn
 //! immediately (no frame timer). Output is cell-diffed and sent in one write(2).
 
+mod funding;
+mod history;
+mod views;
+
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::collections::{HashMap, VecDeque};
@@ -156,6 +160,8 @@ struct Row {
     dir: i8,
     seq: u64,
     at: Instant,
+    /// funding interval in hours (from fundingInfo; 8 until known)
+    fint: u8,
     tradfi: bool,
     usdt_perp: bool,
 }
@@ -173,12 +179,25 @@ enum Sort {
     Vol,
     ChgDesc,
     ChgAsc,
+    FundDesc,
+    FundAsc,
 }
-const SORTS: [(Sort, &str); 3] = [(Sort::Vol, "VOL v"), (Sort::ChgDesc, "24h% v"), (Sort::ChgAsc, "24h% ^")];
+const SORTS: [(Sort, &str); 5] = [
+    (Sort::Vol, "VOL v"),
+    (Sort::ChgDesc, "24h% v"),
+    (Sort::ChgAsc, "24h% ^"),
+    (Sort::FundDesc, "FUND/yr v"),
+    (Sort::FundAsc, "FUND/yr ^"),
+];
 
 /// Name as shown: USDT perpetuals drop the quote ("BTCUSDT" -> "BTC"); anything else keeps its full symbol.
 fn disp(r: &Row) -> &str {
     if r.usdt_perp { &r.sym[..r.sym.len() - 4] } else { &r.sym }
+}
+
+/// Funding rate per year, in percent: the per-interval rate times intervals per year.
+fn ann(r: &Row) -> f64 {
+    r.fund * 8760.0 / r.fint as f64
 }
 
 fn passes(r: &Row, market: u8, class: u8, filter: &str) -> bool {
@@ -192,6 +211,13 @@ fn passes(r: &Row, market: u8, class: u8, filter: &str) -> bool {
 const CW: [usize; 5] = [33, 48, 55, 68, 119];
 const HDR_LINES: usize = 5; // 3 status lines + sessions + column header
 const FIXED: usize = 6; // + footer
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Board,
+    Plot,
+    Dist,
+}
 
 #[derive(Default)]
 struct Stat {
@@ -233,6 +259,23 @@ struct App {
     live_since: Instant,
     rerank_secs: u64,
     in_rank: Vec<bool>,
+    // visualisations
+    view: View,
+    view_dirty: bool,
+    view_seq: u64,
+    plot_rebase: bool,
+    plot_full: bool,
+    hist: history::History,
+    vlines: Vec<Vec<u8>>,
+    canvas: views::Canvas,
+    fbuf: Vec<f32>,
+    bases: Vec<f32>,
+    pairs: Vec<(f64, u32)>,
+    plot_set: Vec<u32>,
+    plot_set_at: Instant,
+    fund_hours: funding::Hours,
+    fund_status: String,
+    fund_at: Option<SystemTime>,
     page: usize,
     filter: String,
     filtering: bool,
@@ -353,6 +396,23 @@ impl App {
             live_since: now,
             rerank_secs: 60,
             in_rank: Vec::new(),
+            view: View::Board,
+            view_dirty: true,
+            view_seq: 0,
+            plot_rebase: false,
+            plot_full: false,
+            // 1024 samples x 1024 symbols of f32 = 4 MB, fixed for the life of the process
+            hist: history::History::new(1024, now),
+            vlines: Vec::new(),
+            canvas: views::Canvas::default(),
+            fbuf: Vec::new(),
+            bases: Vec::new(),
+            pairs: Vec::new(),
+            plot_set: Vec::new(),
+            plot_set_at: now,
+            fund_hours: funding::Hours::new(),
+            fund_status: "assuming 8h intervals, fetching".into(),
+            fund_at: None,
             page: 0,
             filter: String::new(),
             filtering: false,
@@ -411,6 +471,7 @@ impl App {
                     dir: 0,
                     seq: 0,
                     at: now,
+                    fint: self.fund_hours.get(sym).copied().unwrap_or(funding::DEFAULT_HOURS),
                     tradfi: false,
                     usdt_perp: sym.ends_with("USDT") && !sym.contains('_'),
                 });
@@ -419,6 +480,33 @@ impl App {
             }
         };
         &mut self.rows[i]
+    }
+
+    /// Record the current 24h% of every symbol into the history ring.
+    fn sample(&mut self, now: Instant) {
+        if self.tseq == 0 {
+            return; // nothing received yet
+        }
+        let rows = &self.rows;
+        self.hist.push(now, now_ms(), rows.len(), |i| if rows[i].has_tick { rows[i].chg as f32 } else { f32::NAN });
+    }
+
+    fn set_funding(&mut self, res: Result<funding::Hours, String>, at: SystemTime) {
+        match res {
+            Ok(hours) => {
+                for r in &mut self.rows {
+                    r.fint = hours.get(&r.sym).copied().unwrap_or(funding::DEFAULT_HOURS);
+                }
+                self.fund_status = format!("intervals for {} symbols", hours.len());
+                self.fund_hours = hours;
+                self.fund_at = Some(at);
+            }
+            Err(e) if self.fund_hours.is_empty() => {
+                self.fund_status = format!("assuming 8h intervals, fetch failed: {e}")
+            }
+            Err(_) => {} // keep the cached intervals
+        }
+        self.view_dirty = true;
     }
 
     fn on_text(&mut self, txt: &str) -> Result<(), serde_json::Error> {
@@ -526,6 +614,7 @@ impl App {
 
     /// Returns true to quit.
     fn on_keys(&mut self, b: &[u8]) -> bool {
+        self.view_dirty = true;
         let mut i = 0;
         while i < b.len() {
             let c = b[i];
@@ -567,6 +656,8 @@ impl App {
                             b"H" | b"1~" => self.page = 0,
                             _ => {}
                         }
+                    } else if self.view != View::Board {
+                        self.view = View::Board;
                     } else {
                         self.filter.clear();
                         self.page = 0;
@@ -576,6 +667,11 @@ impl App {
                 b'q' | b'Q' => return true,
                 b's' => {
                     self.sort = (self.sort + 1) % SORTS.len();
+                    self.page = 0;
+                    self.rank_dirty = true;
+                }
+                b'S' => {
+                    self.sort = (self.sort + SORTS.len() - 1) % SORTS.len();
                     self.page = 0;
                     self.rank_dirty = true;
                 }
@@ -594,8 +690,13 @@ impl App {
                 }
                 b'/' => self.filtering = true,
                 b'?' | b'h' => self.help = !self.help,
-                b'j' | b' ' | b'n' => self.page += 1,
-                b'k' | b'p' => self.page = self.page.saturating_sub(1),
+                b'p' => self.view = if self.view == View::Plot { View::Board } else { View::Plot },
+                b'd' => self.view = if self.view == View::Dist { View::Board } else { View::Dist },
+                b'b' => self.view = View::Board,
+                b'x' => self.plot_rebase = !self.plot_rebase,
+                b'z' => self.plot_full = !self.plot_full,
+                b'j' | b' ' => self.page += 1,
+                b'k' => self.page = self.page.saturating_sub(1),
                 b'g' => self.page = 0,
                 _ => {}
             }
@@ -635,6 +736,9 @@ impl App {
                     Sort::Vol => y.qvol.total_cmp(&x.qvol),
                     Sort::ChgDesc => y.chg.total_cmp(&x.chg),
                     Sort::ChgAsc => x.chg.total_cmp(&y.chg),
+                    // symbols with no funding rate yet go last either way
+                    Sort::FundDesc => (y.has_fund, ann(y)).partial_cmp(&(x.has_fund, ann(x))).unwrap(),
+                    Sort::FundAsc => (y.has_fund, ann(x)).partial_cmp(&(x.has_fund, ann(y))).unwrap(),
                 }
                 .then_with(|| x.sym.cmp(&y.sym))
             });
@@ -675,15 +779,16 @@ impl App {
 
         self.out.clear();
         self.out.extend_from_slice(b"\x1b[?2026h");
-        let layout = (w, h, level * 16 + sw, ncols);
+        let layout = (w, h, level * 16 + sw + 1000 * self.view as usize, ncols);
         if layout != self.layout || WINCH.swap(false, Ordering::Relaxed) {
             self.layout = layout;
             self.w = w;
             self.h = h;
             self.prev.clear();
+            self.view_dirty = true;
             self.out.extend_from_slice(b"\x1b[0m\x1b[2J");
         }
-        self.prev.resize(FIXED + slots, Vec::new());
+        self.prev.resize((FIXED + slots).max(h + 2), Vec::new());
 
         // ---- line 1: status
         let s = &mut self.scratch;
@@ -739,6 +844,33 @@ impl App {
         let _ = write!(s, " rc {} err {} | ", self.reconnects, self.errors);
         hms(s, now_ms(), true);
         emit(&mut self.out, &mut self.prev[1], s, 2, 1, true);
+
+        if self.view != View::Board {
+            // Recomputed once per ticker push (or on a key / resize), not on every message.
+            if self.view_dirty || self.view_seq != self.tseq {
+                let pick = self.view_dirty; // a key, resize or filter change: re-pick the plotted set
+                self.view_dirty = false;
+                self.view_seq = self.tseq;
+                let nl = h.saturating_sub(2).max(1);
+                match self.view {
+                    View::Plot => self.draw_plot(w, nl, pick),
+                    _ => self.draw_dist(w, nl),
+                }
+                // cost of recomputing the view, shown at the end of its key line
+                if let Some(l) = self.vlines.last_mut() {
+                    let _ = write!(l, "\x1b[2m | computed in {}us\x1b[0m", t0.elapsed().as_micros());
+                }
+            }
+            for (i, l) in self.vlines.iter().enumerate() {
+                emit(&mut self.out, &mut self.prev[2 + i], l, 3 + i, 1, true);
+            }
+            self.out.extend_from_slice(b"\x1b[?2026l");
+            let t1 = Instant::now();
+            write_all(fd, &self.out);
+            self.t_draw = (t1 - t0).as_secs_f64() * 1e6;
+            self.t_write = t1.elapsed().as_secs_f64() * 1e6;
+            return;
+        }
 
         // ---- line 3: movers (within current filter)
         s.clear();
@@ -798,7 +930,7 @@ impl App {
         for c in 0..ncols {
             let _ = write!(s, "{:<sw$} {:>10} {:>7}", "SYMBOL", "MARK", "24h%");
             if level >= 1 {
-                let _ = write!(s, " {:>8} {:>5}", "FUND%", "NEXT");
+                let _ = write!(s, " {:>8} {:>5}", "FUND/yr%", "NEXT");
             }
             if level >= 2 {
                 let _ = write!(s, " {:>6}", "QVOL");
@@ -841,7 +973,7 @@ impl App {
         s.clear();
         if self.help || self.liqs.is_empty() {
             s.extend_from_slice(
-                b"\x1b[0;2m q quit | s sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
+                b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | p plot | d distributions | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
             );
         } else {
             s.extend_from_slice(b"\x1b[0;1m LIQ\x1b[0m");
@@ -953,8 +1085,14 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
     let plain: &[u8] = if stale { b"\x1b[0;2m " } else { b"\x1b[0m " };
     if level >= 1 {
         if r.has_fund {
-            sgr(s, r.fund, false);
-            let _ = write!(s, " {:>+8.4}", r.fund);
+            // annualised, so contracts with 1h, 4h and 8h funding compare directly
+            let a = ann(r);
+            sgr(s, a, false);
+            let _ = if a.abs() < 999.995 {
+                write!(s, " {:>+8.2}", a)
+            } else {
+                write!(s, " {:>+8.0}", a.clamp(-999_999.0, 999_999.0))
+            };
         } else {
             s.extend_from_slice(b"        -");
         }
@@ -1152,6 +1290,14 @@ fn main() {
     term_enter();
 
     let mut app = App::new();
+    // Funding intervals: use the disk cache straight away, refresh in the background when it expires.
+    let mut first_fetch = Duration::ZERO;
+    if let Some((hours, at)) = funding::load_cache() {
+        let age = at.elapsed().unwrap_or(funding::TTL);
+        first_fetch = funding::TTL.saturating_sub(age);
+        app.set_funding(Ok(hours), at);
+    }
+    let funding_rx = funding::spawn(first_fetch);
     app.market = all as u8;
     app.class = class;
     app.rerank_secs = rerank;
@@ -1199,6 +1345,9 @@ fn main() {
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
         let t_rx = Instant::now();
         let mut dirty = rc < 0 || WINCH.load(Ordering::Relaxed); // EINTR: resize
+        if let Ok(res) = funding_rx.try_recv() {
+            app.set_funding(res, SystemTime::now());
+        }
 
         if fds[0].revents != 0 {
             let mut kb = [0u8; 64];
@@ -1261,6 +1410,10 @@ fn main() {
                 app.t_parse = (t_parsed - t_rx).as_secs_f64() * 1e6;
                 app.proc_us.add(t_rx.elapsed().as_secs_f64() * 1e6);
             }
+        }
+        // After the frame is on screen: sampling never delays a redraw.
+        if app.hist.due(t_rx) {
+            app.sample(t_rx);
         }
     }
     term_leave();

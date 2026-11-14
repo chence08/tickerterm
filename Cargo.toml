@@ -1,6 +1,6 @@
 [package]
 name = "tickerterm"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Low-latency terminal board for Binance USD-M futures market-wide streams"
@@ -16,6 +16,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
 [profile.release]
 opt-level = 3
