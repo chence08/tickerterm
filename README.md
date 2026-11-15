@@ -86,6 +86,7 @@ tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank
 - **Header:** any active prompt or filter, connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
 - **VWAP:** the 24h volume-weighted average price, always shown. Its background is green when VWAP is below the mark price and red when it is above, in ten shades by the percentage gap: no colour within 0.25%, full colour at 5%.
 - **Open interest (`OI`, detail level 3 and up):** each symbol's open interest value in USD. Its background runs from red to green by how far it sits from its own one-hour average: green when positions are being added, red when they are being closed, full colour at 5% either way. The header shows the total for the current tab (all, TradFi, crypto, commodities, or whatever a filter leaves), with `(fetched/total)` while some symbols are still to be fetched.
+- **USDC/USDT spot:** a line pinned above the grid with the best bid and ask of USDC/USDT on Binance spot and their sizes, the spread, the mid against 1.0000 in basis points, how the size at the touch is split between bid and ask, and the order book update id. It comes from the spot `usdcusdt@bookTicker` stream on its own connection and redraws as the quote changes.
 - **TradFi sessions:** whether each underlying market (US equities, commodities, FX, Korea, Hong Kong, China) is open, in pre/post-market, overnight or closed, with the time left in that state.
 - **Footer (liquidation flow):** two lines, shorts liquidated above (green) and longs liquidated below (red), in USD notional.
   - Rolling totals over 1 minute, 5 minutes and 1 hour.
@@ -141,7 +142,7 @@ A table of every symbol quoted on both Binance and Hyperliquid, ranked by the ga
 - **BASIS%:** Hyperliquid's mark price against Binance's. Entering when the basis is against you costs part of the spread.
 - **BIN OI, HL OI, BIN VOL, HL VOL:** open interest and 24h volume on each side, in USD, to judge whether the pair can be traded in size.
 
-`s` cycles the sort: largest gap either way, most positive, most negative. The board's filters (`m`, `t`, `/`, `F`) apply. Hyperliquid is polled every 10 seconds from its public `info` endpoint; names are matched to Binance's (`kPEPE` is `1000PEPE`), and a pair is dropped when the two marks differ by more than 20%, which means the ticker is not the same asset. Both rates are current estimates and move, and the spread ignores fees, slippage and margin costs.
+`s` cycles the sort: largest gap either way, most positive, most negative. The board's filters (`m`, `t`, `/`, `F`) apply. Hyperliquid is polled every 10 seconds from its public `info` endpoint, both its own crypto markets and the stocks and commodities on trade.xyz. Names are matched to Binance's (`kPEPE` is `1000PEPE`, trade.xyz's `GOLD` is `XAU`), and a pair is dropped when the two marks differ by more than 20%, which means the ticker is not the same asset. Both rates are current estimates and move, and the spread ignores fees, slippage and margin costs.
 
 ## Open interest and commodities
 
@@ -152,7 +153,7 @@ Neither is on the WebSocket streams, so a background thread fetches them over RE
 
 ## Data sources
 
-One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s`, `!forceOrder@arr` and `tradingSession`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls.
+One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s`, `!forceOrder@arr` and `tradingSession`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls. The USDC/USDT line uses a second connection, to `wss://stream.binance.com:9443/ws/usdcusdt@bookTicker`, which reconnects on its own.
 
 This project is not affiliated with Binance. Nothing here is financial advice.
 

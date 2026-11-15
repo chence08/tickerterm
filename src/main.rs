@@ -10,6 +10,7 @@ mod history;
 mod hl;
 mod liq;
 mod oi;
+mod spot;
 mod surge;
 mod views;
 
@@ -225,8 +226,8 @@ fn passes(r: &Row, market: u8, class: u8, pin_only: bool, filter: &str) -> bool 
 
 /// Visible cell width per detail level (without the 2-char gutter).
 const CW: [usize; 5] = [44, 59, 73, 86, 126];
-const HDR_LINES: usize = 5; // 3 status lines + sessions + column header
-const FIXED: usize = 7; // + two footer lines (liquidation flow)
+const HDR_LINES: usize = 6; // 3 status lines + sessions + USDC/USDT spot + column header
+const FIXED: usize = 8; // + two footer lines (liquidation flow)
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -268,6 +269,7 @@ struct App {
     commodities: HashSet<String>,
     oi_map: HashMap<String, (f64, f64)>,
     oi_note: String,
+    usdc: spot::Book,
     hl_gen: u64,
     hl_at: Option<Instant>,
     hl_err: String,
@@ -427,6 +429,7 @@ impl App {
             commodities: HashSet::new(),
             oi_map: HashMap::with_capacity(1024),
             oi_note: String::new(),
+            usdc: spot::Book::default(),
             hl_gen: 1,
             hl_at: None,
             hl_err: String::new(),
@@ -1108,6 +1111,11 @@ impl App {
         }
         emit(&mut self.out, &mut self.prev[FIXED - 1], s, 4, 1, true);
 
+        // ---- line 5: USDC/USDT spot best bid and ask, pinned above the grid
+        s.clear();
+        spot::line(s, &self.usdc, hum);
+        emit(&mut self.out, &mut self.prev[6], s, 5, 1, true);
+
         // ---- line 5: column headers
         s.clear();
         s.extend_from_slice(b"\x1b[0;7m");
@@ -1539,6 +1547,7 @@ fn main() {
     let funding_rx = funding::spawn(first_fetch);
     let rest_rx = oi::spawn();
     let hl_rx = hl::spawn();
+    let usdc = spot::spawn();
     app.market = all as u8;
     app.class = class;
     app.pin_mode = if hide_pins { 2 } else { 0 };
@@ -1583,12 +1592,17 @@ fn main() {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd { fd: usdc.wake_fd, events: libc::POLLIN, revents: 0 },
         ];
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 1000) };
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, 1000) };
         let t_rx = Instant::now();
         let mut dirty = rc < 0 || WINCH.load(Ordering::Relaxed); // EINTR: resize
         if let Ok(res) = funding_rx.try_recv() {
             app.set_funding(res, SystemTime::now());
+        }
+        if let Some(book) = usdc.take() {
+            app.usdc = book;
+            dirty |= app.view == View::Board;
         }
         if let Ok(res) = hl_rx.try_recv() {
             app.on_hl(res);

@@ -1,8 +1,10 @@
 //! Hyperliquid funding, for the funding-arbitrage view.
 //!
-//! One `POST https://api.hyperliquid.xyz/info {"type":"metaAndAssetCtxs"}` returns every perp with
-//! its current funding rate (charged hourly), mark price, open interest and 24h volume. A background
-//! thread polls it every 10 seconds (request weight 20, against 1200 a minute allowed per IP).
+//! One `POST https://api.hyperliquid.xyz/info {"type":"metaAndAssetCtxs"}` returns every perp of one
+//! dex with its current funding rate (charged hourly), mark price, open interest and 24h volume.
+//! Hyperliquid's own dex lists crypto; stocks, indices and commodities trade on builder-deployed
+//! dexes, of which trade.xyz ("xyz") is polled too. A background thread asks for each every 10
+//! seconds (request weight 20 each, against 1200 a minute allowed per IP).
 
 use crate::{App, Row, ann, disp, hum, tint, wide};
 use serde::Deserialize;
@@ -11,6 +13,18 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 const URL: &str = "https://api.hyperliquid.xyz/info";
+/// Dexes polled: "" is Hyperliquid's own, "xyz" is trade.xyz. Their assets are named "xyz:NVDA".
+const DEXES: [&str; 2] = ["", "xyz"];
+/// trade.xyz names that differ from Binance's base asset.
+const ALIASES: [(&str, &str); 7] = [
+    ("GOLD", "XAU"),
+    ("SILVER", "XAG"),
+    ("PLATINUM", "XPT"),
+    ("PALLADIUM", "XPD"),
+    ("BRENTOIL", "BZ"),
+    ("SKHX", "SKHYNIX"),
+    ("SMSN", "SAMSUNG"),
+];
 const EVERY: Duration = Duration::from_secs(10);
 /// Hyperliquid charges funding every hour.
 const PER_YEAR: f64 = 8760.0;
@@ -49,8 +63,13 @@ pub struct Quote {
     pub vol_usd: f64,
 }
 
-/// "BTC" -> "BTCUSDT"; Hyperliquid's "kPEPE" (1000 PEPE) is Binance's "1000PEPEUSDT".
+/// "BTC" -> "BTCUSDT"; Hyperliquid's "kPEPE" (1000 PEPE) is Binance's "1000PEPEUSDT";
+/// trade.xyz's "xyz:GOLD" is "XAUUSDT".
 fn binance_symbol(name: &str) -> String {
+    if let Some((_dex, base)) = name.split_once(':') {
+        let base = ALIASES.iter().find(|a| a.0 == base).map_or(base, |a| a.1);
+        return format!("{base}USDT");
+    }
     match name.strip_prefix('k') {
         Some(rest) if rest.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => format!("1000{rest}USDT"),
         _ => format!("{name}USDT"),
@@ -84,13 +103,18 @@ pub fn spawn() -> Receiver<Result<Vec<Quote>, String>> {
         let agent: ureq::Agent =
             ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).user_agent("tickerterm").build().into();
         loop {
-            let res = agent
-                .post(URL)
-                .header("Content-Type", "application/json")
-                .send(r#"{"type":"metaAndAssetCtxs"}"#)
-                .map_err(|e| e.to_string())
-                .and_then(|mut r| r.body_mut().read_to_string().map_err(|e| e.to_string()))
-                .and_then(|b| parse(&b));
+            // all dexes or nothing: a poll replaces the previous one as a whole
+            let res = DEXES.iter().try_fold(Vec::new(), |mut all, dex| {
+                let quotes = agent
+                    .post(URL)
+                    .header("Content-Type", "application/json")
+                    .send(format!(r#"{{"type":"metaAndAssetCtxs","dex":"{dex}"}}"#))
+                    .map_err(|e| e.to_string())
+                    .and_then(|mut r| r.body_mut().read_to_string().map_err(|e| e.to_string()))
+                    .and_then(|b| parse(&b))?;
+                all.extend(quotes);
+                Ok::<_, String>(all)
+            });
             // back off after a failure (offline, rate limited)
             let wait = if res.is_ok() { EVERY } else { EVERY * 6 };
             if tx.send(res).is_err() {
@@ -120,6 +144,12 @@ impl App {
                 for q in quotes {
                     if let Some(&i) = self.index.get(&q.sym) {
                         let r = &mut self.rows[i];
+                        // The same ticker can be a coin on one dex and a stock on another (BB, QNT):
+                        // take the quote whose price says it is the asset Binance lists.
+                        let mark = crate::pf(&r.mark_s);
+                        if mark > 0.0 && (q.mark / mark - 1.0).abs() >= MAX_BASIS {
+                            continue;
+                        }
                         (r.hl_fund, r.hl_mark, r.hl_oi, r.hl_vol, r.hl_gen) = (q.fund, q.mark, q.oi_usd, q.vol_usd, self.hl_gen);
                     }
                 }
@@ -236,6 +266,9 @@ mod tests {
     fn parses_and_maps_names() {
         assert_eq!(binance_symbol("BTC"), "BTCUSDT");
         assert_eq!(binance_symbol("kPEPE"), "1000PEPEUSDT");
+        assert_eq!(binance_symbol("xyz:NVDA"), "NVDAUSDT");
+        assert_eq!(binance_symbol("xyz:GOLD"), "XAUUSDT");
+        assert_eq!(binance_symbol("xyz:SKHX"), "SKHYNIXUSDT");
         let body = r#"[{"universe":[{"name":"BTC","szDecimals":5},{"name":"kSHIB"},{"name":"OLD","isDelisted":true},{"name":"NOPX"}]},
             [{"funding":"0.00001","openInterest":"100","markPx":"50000","dayNtlVlm":"1e9"},
              {"funding":"-0.00002","openInterest":"10","markPx":"0.02","dayNtlVlm":"5"},
