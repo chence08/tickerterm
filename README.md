@@ -67,6 +67,7 @@ tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank
 | `1`–`5`, `a` | Detail level, or auto |
 | `p` | 24h% history plot (`x` absolute / change since start, `z` p1–p99 / full range) |
 | `d` | Distribution histograms |
+| `A` | Funding arbitrage against Hyperliquid (`s` cycles its sort) |
 | `f` | Pin or unpin: type one or more names (`btc` or `btc,eth,sol`) and press Enter |
 | `F` | Cycle favourites: pinned first, pinned only, hidden |
 | `/` | Filter by symbol (Esc clears) |
@@ -79,10 +80,11 @@ tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank
 ## What it shows
 
 - **Grid:** as many columns of symbols as the terminal fits. USDT perpetuals are shown without the `USDT` suffix. Auto detail never drops symbols for detail, but spends leftover width on richer cells.
-- **Detail levels (`1`–`5`):** mark price and 24h %, then annualised funding rate and time to the next funding, then quote volume and open interest, then trade count and position in the 24h low–high range, then high, low, VWAP, last price and last quantity.
+- **Detail levels (`1`–`5`):** mark price, 24h % and 24h VWAP, then annualised funding rate and time to the next funding, then quote volume and open interest, then trade count and position in the 24h low–high range, then high, low, last price and last quantity.
 - **Colour:** 24h % and funding rate are green or red by sign. Mark price is drawn plain, since it moves every second for every symbol. TradFi contracts are cyan, commodities (gold, silver, platinum, palladium, copper, crude, Brent, natural gas) orange.
 - **Volume surge glow:** the background behind a symbol's name turns yellow when its traded volume surges. Brightness is continuous, not on/off: it compares the volume rate over the last 10–20 seconds with the average rate over the rest of the last 15 minutes, starts as dark amber at 2x and reaches bright yellow at 16x (log scale, 24-bit colour where the terminal supports it, a five-step 256-colour ramp otherwise). It fades as the burst ends, and a sustained higher rate fades too as the 15-minute average catches up. Nothing glows for the first two minutes after start, while the baseline builds. The stream has no per-interval volume, so this is derived from changes in the rolling 24h quote volume, corrected for what is expected to drop out of the 24h window; it is an estimate, and bursts under $5K are ignored.
 - **Header:** any active prompt or filter, connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
+- **VWAP:** the 24h volume-weighted average price, always shown. Its background is green when VWAP is below the mark price and red when it is above, in ten shades by the percentage gap: no colour within 0.25%, full colour at 5%.
 - **Open interest (`OI`, detail level 3 and up):** each symbol's open interest value in USD. Its background runs from red to green by how far it sits from its own one-hour average: green when positions are being added, red when they are being closed, full colour at 5% either way. The header shows the total for the current tab (all, TradFi, crypto, commodities, or whatever a filter leaves), with `(fetched/total)` while some symbols are still to be fetched.
 - **TradFi sessions:** whether each underlying market (US equities, commodities, FX, Korea, Hong Kong, China) is open, in pre/post-market, overnight or closed, with the time left in that state.
 - **Footer (liquidation flow):** two lines, shorts liquidated above (green) and longs liquidated below (red), in USD notional.
@@ -128,6 +130,18 @@ Binance pushes these streams once per second, which is the floor for any client.
 Background work stays off that path: history is sampled after each frame is on screen, the funding fetch runs on its own thread, and the visualisations are recomputed once per second rather than per message.
 
 The header shows both the exchange-to-receive delay and the receive-to-screen time, which is typically a few hundred microseconds.
+
+## Funding arbitrage (`A`)
+
+A table of every symbol quoted on both Binance and Hyperliquid, ranked by the gap between their annualised funding rates.
+
+- **BIN/yr%, HL/yr%:** each venue's funding rate per year. Binance's is the rate for its 1, 4 or 8 hour interval; Hyperliquid charges hourly, so its rate is multiplied by 8760.
+- **SPREAD:** Binance minus Hyperliquid, in percentage points a year, tinted green or red by size (no colour under 2.5, full colour at 50).
+- **COLLECT BY:** the pair of positions that earns the spread: short where funding is higher, long where it is lower (`S BIN  L HL` or the reverse).
+- **BASIS%:** Hyperliquid's mark price against Binance's. Entering when the basis is against you costs part of the spread.
+- **BIN OI, HL OI, BIN VOL, HL VOL:** open interest and 24h volume on each side, in USD, to judge whether the pair can be traded in size.
+
+`s` cycles the sort: largest gap either way, most positive, most negative. The board's filters (`m`, `t`, `/`, `F`) apply. Hyperliquid is polled every 10 seconds from its public `info` endpoint; names are matched to Binance's (`kPEPE` is `1000PEPE`), and a pair is dropped when the two marks differ by more than 20%, which means the ticker is not the same asset. Both rates are current estimates and move, and the spread ignores fees, slippage and margin costs.
 
 ## Open interest and commodities
 

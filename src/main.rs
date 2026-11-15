@@ -7,6 +7,7 @@
 mod favorites;
 mod funding;
 mod history;
+mod hl;
 mod liq;
 mod oi;
 mod surge;
@@ -152,6 +153,7 @@ struct Row {
     low: f64,
     low_s: String,
     vwap_s: String,
+    vwap: f64,
     qvol: f64,
     trades: u64,
     lqty: f64,
@@ -172,6 +174,13 @@ struct Row {
     /// open interest value in USD and its one-hour average (0 until fetched)
     oi: f64,
     oi_ma: f64,
+    /// Hyperliquid: funding per year in percent, mark, open interest and 24h volume in USD;
+    /// valid while `hl_gen` equals the app's (the asset was in the latest poll)
+    hl_fund: f64,
+    hl_mark: f64,
+    hl_oi: f64,
+    hl_vol: f64,
+    hl_gen: u64,
     usdt_perp: bool,
 }
 
@@ -215,7 +224,7 @@ fn passes(r: &Row, market: u8, class: u8, pin_only: bool, filter: &str) -> bool 
 }
 
 /// Visible cell width per detail level (without the 2-char gutter).
-const CW: [usize; 5] = [33, 48, 62, 75, 126];
+const CW: [usize; 5] = [44, 59, 73, 86, 126];
 const HDR_LINES: usize = 5; // 3 status lines + sessions + column header
 const FIXED: usize = 7; // + two footer lines (liquidation flow)
 
@@ -224,6 +233,7 @@ enum View {
     Board,
     Plot,
     Dist,
+    Arb,
 }
 
 #[derive(Default)]
@@ -258,6 +268,10 @@ struct App {
     commodities: HashSet<String>,
     oi_map: HashMap<String, (f64, f64)>,
     oi_note: String,
+    hl_gen: u64,
+    hl_at: Option<Instant>,
+    hl_err: String,
+    arb_sort: usize,
     truecolor: bool,
     /// footer lines, their cache key, per-symbol scratch, and whether the right side shows the tape
     flines: [Vec<u8>; 2],
@@ -413,6 +427,10 @@ impl App {
             commodities: HashSet::new(),
             oi_map: HashMap::with_capacity(1024),
             oi_note: String::new(),
+            hl_gen: 1,
+            hl_at: None,
+            hl_err: String::new(),
+            arb_sort: 0,
             truecolor: std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit")),
             flines: [Vec::new(), Vec::new()],
             fkey: (u64::MAX, 0, false),
@@ -498,6 +516,7 @@ impl App {
                     low: 0.0,
                     low_s: String::new(),
                     vwap_s: String::new(),
+                    vwap: 0.0,
                     qvol: 0.0,
                     trades: 0,
                     lqty: 0.0,
@@ -512,6 +531,11 @@ impl App {
                     pinned: self.pins.contains(sym),
                     fint: self.fund_hours.get(sym).copied().unwrap_or(funding::DEFAULT_HOURS),
                     tradfi: false,
+                    hl_fund: 0.0,
+                    hl_mark: 0.0,
+                    hl_oi: 0.0,
+                    hl_vol: 0.0,
+                    hl_gen: 0,
                     commodity: self.commodities.contains(sym),
                     oi: self.oi_map.get(sym).map_or(0.0, |v| v.0),
                     oi_ma: self.oi_map.get(sym).map_or(0.0, |v| v.1),
@@ -633,6 +657,7 @@ impl App {
                 r.low = pf(t.l);
                 set(&mut r.low_s, t.l);
                 set(&mut r.vwap_s, t.w);
+                r.vwap = pf(t.w);
                 r.qvol = pf(t.q);
                 r.trades = t.n;
                 r.lqty = pf(t.lq);
@@ -779,6 +804,7 @@ impl App {
                     }
                 }
                 b'q' | b'Q' => return true,
+                b's' | b'S' if self.view == View::Arb => self.arb_sort = (self.arb_sort + 1) % hl::ARB_SORTS.len(),
                 b's' => {
                     self.sort = (self.sort + 1) % SORTS.len();
                     self.page = 0;
@@ -816,6 +842,7 @@ impl App {
                 b'l' => self.tape = !self.tape,
                 b'p' => self.view = if self.view == View::Plot { View::Board } else { View::Plot },
                 b'd' => self.view = if self.view == View::Dist { View::Board } else { View::Dist },
+                b'A' => self.view = if self.view == View::Arb { View::Board } else { View::Arb },
                 b'b' => self.view = View::Board,
                 b'x' => self.plot_rebase = !self.plot_rebase,
                 b'z' => self.plot_full = !self.plot_full,
@@ -1010,6 +1037,7 @@ impl App {
                 let nl = h.saturating_sub(2).max(1);
                 match self.view {
                     View::Plot => self.draw_plot(w, nl, pick),
+                    View::Arb => self.draw_arb(w, nl),
                     _ => self.draw_dist(w, nl),
                 }
                 // cost of recomputing the view, shown at the end of its key line
@@ -1084,7 +1112,7 @@ impl App {
         s.clear();
         s.extend_from_slice(b"\x1b[0;7m");
         for c in 0..ncols {
-            let _ = write!(s, "{:<sw$} {:>10} {:>7}", "SYMBOL", "MARK", "24h%");
+            let _ = write!(s, "{:<sw$} {:>10} {:>7} {:>10}", "SYMBOL", "MARK", "24h%", "VWAP");
             if level >= 1 {
                 let _ = write!(s, " {:>8} {:>5}", "FUND/yr%", "NEXT");
             }
@@ -1095,7 +1123,7 @@ impl App {
                 let _ = write!(s, " {:>6} {:5}", "TRADES", "L<->H");
             }
             if level >= 4 {
-                let _ = write!(s, " {:>10} {:>10} {:>10} {:>10} {:>6}", "HIGH", "LOW", "VWAP", "LAST", "LQTY");
+                let _ = write!(s, " {:>10} {:>10} {:>10} {:>6}", "HIGH", "LOW", "LAST", "LQTY");
             }
             if c + 1 < ncols {
                 s.extend_from_slice(b"  ");
@@ -1128,7 +1156,7 @@ impl App {
         if self.help || !self.flow.seen {
             const HELP: [&[u8]; 2] = [
                 b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/commodities/both | f pin/unpin | F pins first/only/hidden | 1-5 detail, a auto | / filter (esc clears)\x1b[0m",
-                b"\x1b[0;2m p plot | d distributions | arrows/j/k page | l liquidations: 5m totals by symbol / latest prints | ? liquidation flow\x1b[0m",
+                b"\x1b[0;2m p plot | d distributions | A funding arbitrage vs Hyperliquid | arrows/j/k page | l liquidations: 5m totals by symbol / latest prints | ? liquidation flow\x1b[0m",
             ];
             emit(&mut self.out, &mut self.prev[5], HELP[0], h.max(FIXED) - 1, 1, true);
             emit(&mut self.out, &mut self.prev[4], HELP[1], h.max(FIXED), 1, true);
@@ -1195,11 +1223,11 @@ fn glow(s: &mut Vec<u8>, g: u8, truecolor: bool) {
     }
 }
 
-/// Background for open interest `dev` away from its one-hour average (0.05 = 5% above): green when
-/// positions are being added, red when they are being closed, full colour at 5% either way.
-fn oi_bg(s: &mut Vec<u8>, dev: f64, truecolor: bool) {
+/// Red-to-green background for a signed deviation `dev`: green above zero, red below, in ten shades
+/// reaching full colour at `full`. Within a twentieth of `full` of zero there is no colour at all.
+fn tint(s: &mut Vec<u8>, dev: f64, full: f64, truecolor: bool) {
     const STEPS: f64 = 10.0;
-    let k = ((dev.abs() / 0.05).min(1.0) * STEPS).round();
+    let k = ((dev.abs() / full).min(1.0) * STEPS).round();
     if k == 0.0 {
         return;
     }
@@ -1272,6 +1300,15 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
         write!(s, " {:>+7.0}", r.chg.clamp(-99999.0, 99999.0))
     };
     let plain: &[u8] = if stale { b"\x1b[0;2m " } else { b"\x1b[0m " };
+    // 24h VWAP, tinted by where the mark price sits against it: green when the mark is above
+    // (VWAP below), red when it is below, nothing within 0.25%, full colour at 5%.
+    s.extend_from_slice(plain);
+    let m = pf(mark);
+    if !stale && r.vwap > 0.0 && m > 0.0 {
+        tint(s, m / r.vwap - 1.0, 0.05, truecolor);
+    }
+    price(s, &r.vwap_s, r.vwap, 10);
+    s.extend_from_slice(if stale { b"\x1b[0;2m" } else { b"\x1b[0m" });
     if level >= 1 {
         if r.has_fund {
             // annualised, so contracts with 1h, 4h and 8h funding compare directly
@@ -1312,7 +1349,8 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
         s.extend_from_slice(plain);
         if r.oi > 0.0 {
             if !stale && r.oi_ma > 0.0 {
-                oi_bg(s, r.oi / r.oi_ma - 1.0, truecolor);
+                // against its one-hour average: green when positions are being added, red when closed
+                tint(s, r.oi / r.oi_ma - 1.0, 0.05, truecolor);
             }
             hum(s, r.oi, 6);
             s.extend_from_slice(if stale { b"\x1b[0;2m" } else { b"\x1b[0m" });
@@ -1334,8 +1372,6 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
         price(s, &r.high_s, r.high, 10);
         s.push(b' ');
         price(s, &r.low_s, r.low, 10);
-        s.push(b' ');
-        price(s, &r.vwap_s, pf(&r.vwap_s), 10);
         s.push(b' ');
         price(s, &r.last_s, r.last, 10);
         s.push(b' ');
@@ -1502,6 +1538,7 @@ fn main() {
     }
     let funding_rx = funding::spawn(first_fetch);
     let rest_rx = oi::spawn();
+    let hl_rx = hl::spawn();
     app.market = all as u8;
     app.class = class;
     app.pin_mode = if hide_pins { 2 } else { 0 };
@@ -1552,6 +1589,10 @@ fn main() {
         let mut dirty = rc < 0 || WINCH.load(Ordering::Relaxed); // EINTR: resize
         if let Ok(res) = funding_rx.try_recv() {
             app.set_funding(res, SystemTime::now());
+        }
+        if let Ok(res) = hl_rx.try_recv() {
+            app.on_hl(res);
+            dirty |= app.view == View::Arb;
         }
         while let Ok(msg) = rest_rx.try_recv() {
             app.on_rest(msg);
