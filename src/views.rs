@@ -62,6 +62,7 @@ impl App {
             let (pw, ph) = (cw * 2, ch * 4);
             let (hist, rows, order) = (&self.hist, &self.rows, &self.order);
             let (rebase, full) = (self.plot_rebase, self.plot_full);
+            let show_pins = self.pin_mode != 2;
 
             // one label row per line, so never more lines than rows
             let want = TOP.min(ch).min(order.len());
@@ -70,7 +71,7 @@ impl App {
                 pairs.extend(order.iter().map(|&s| (rows[s as usize].qvol, s)));
                 // pinned symbols first, then by volume
                 pairs.sort_unstable_by(|a, b| {
-                    let (pa, pb) = (rows[a.1 as usize].pinned, rows[b.1 as usize].pinned);
+                    let (pa, pb) = (show_pins && rows[a.1 as usize].pinned, show_pins && rows[b.1 as usize].pinned);
                     pb.cmp(&pa).then(b.0.total_cmp(&a.0)).then(a.1.cmp(&b.1))
                 });
                 set.clear();
@@ -183,9 +184,10 @@ impl App {
             // ---- title
             let _ = write!(
                 lines[0],
-                "\x1b[0;1m 24h% HISTORY\x1b[0m | {} of {}: pinned, then top by volume | {} | range {} [{:+.2}% .. {:+.2}%] | {} samples, one per {}s",
+                "\x1b[0;1m 24h% HISTORY\x1b[0m | {} of {}: {}top by volume | {} | range {} [{:+.2}% .. {:+.2}%] | {} samples, one per {}s",
                 set.len(),
                 order.len(),
+                if show_pins { "pinned, then " } else { "" },
                 if rebase { "CHANGE SINCE START" } else { "ABSOLUTE" },
                 if full { "FULL" } else { "p1-p99" },
                 lo,

@@ -14,7 +14,8 @@ SYMBOL           MARK    24h% FUND/yr%  NEXT  SYMBOL           MARK    24h% FUND
 *XAU          3842.09   -1.11  -111.14 3h38m  XRP            0.9614   -4.99    +2.52 7h38m  NEAR           3.1230  -10.46   +10.95 7h38m
 SOXL         55.07000   +2.40   -69.90 7h38m  HYPE         66.53000   -8.36    +1.64 3h38m  1000PEPE    0.0039318  -11.49   +10.95 7h38m
 ZEC            868.01   -7.80    +7.83 7h38m  SNDK        849.77000   -0.80   -80.71 7h38m  SOXS         53.66000   -0.76   +55.49 7h38m
- LIQ 16:21:28 SKHYNIX SELL  26.0 @865.98000 | 16:21:25 DODOX SELL  7.74 @0.0309740 | 16:21:24 DODOX SELL   700 @0.0309924 |
+ LIQ SHORTS 1m   394 5m 15.4K 1h 18.6K  x0.1   -12m▕          ▁      ▁ ▁       ▁▁▁▁▁▁▁▁▁▁▁ ▁▁▁ ▁▁▁▁    ▏ 5m  EVAA 6.96K  IDOL 4.84K  NEAR 1.56K
+ LIQ LONGS  1m 8.36K 5m  348K 1h  351K  x0.1 █1.00M▕            ▇▇▇▇▇    ▇▇▇▇                ▇▇▃ ▇ ▇▇▇ ▏ 5m  BTC 240K  ZEC 92.5K  EVAA 7.96K
 ```
 
 ## Install
@@ -46,13 +47,14 @@ cargo build --release
 ## Usage
 
 ```
-tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...]
+tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank SECS] [--url wss://...]
 ```
 
 | Flag | Effect |
 | --- | --- |
 | `--all` | Start with every symbol, including COIN-M, USDC and dated contracts. The default is USDT perpetuals only. |
-| `--tradfi` | Start on the TradFi-only page (stocks, commodities, FX). `--crypto` is the opposite. |
+| `--hide-pins` | Start with favourites hidden. |
+| `--tradfi` | Start on the TradFi-only page (stocks, commodities, FX). `--crypto` is the opposite; `--commodities` starts on the commodities page. |
 | `--rerank SECS` | Seconds between re-rankings. Default 60; `0` re-ranks only when you press `r`. |
 | `--url` | Use a different stream URL. |
 
@@ -61,26 +63,36 @@ tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...]
 | `s` / `S` | Cycle sort forwards / backwards: volume, 24h% descending and ascending, annualised funding descending and ascending |
 | `r` | Re-rank now |
 | `m` | Toggle USDT perpetuals / all symbols |
-| `t` | Cycle TradFi only / crypto only / both |
+| `t` | Cycle TradFi only / crypto only / commodities only / all |
 | `1`–`5`, `a` | Detail level, or auto |
 | `p` | 24h% history plot (`x` absolute / change since start, `z` p1–p99 / full range) |
 | `d` | Distribution histograms |
 | `f` | Pin or unpin: type one or more names (`btc` or `btc,eth,sol`) and press Enter |
-| `F` | Show pinned symbols only |
+| `F` | Cycle favourites: pinned first, pinned only, hidden |
 | `/` | Filter by symbol (Esc clears) |
 | arrows, `j`/`k` | Page |
 | `b`, Esc | Back to the board |
-| `?` | Toggle help / liquidation tape |
+| `l` | Liquidation footer: 5-minute totals per symbol / latest prints with price |
+| `?` | Toggle help / liquidation flow |
 | `q` | Quit |
 
 ## What it shows
 
 - **Grid:** as many columns of symbols as the terminal fits. USDT perpetuals are shown without the `USDT` suffix. Auto detail never drops symbols for detail, but spends leftover width on richer cells.
-- **Detail levels (`1`–`5`):** mark price and 24h %, then annualised funding rate and time to the next funding, then quote volume, then trade count and position in the 24h low–high range, then high, low, VWAP, last price and last quantity.
-- **Colour:** 24h % and funding rate are green or red by sign. Mark price is drawn plain, since it moves every second for every symbol. TradFi contracts are cyan.
+- **Detail levels (`1`–`5`):** mark price and 24h %, then annualised funding rate and time to the next funding, then quote volume and open interest, then trade count and position in the 24h low–high range, then high, low, VWAP, last price and last quantity.
+- **Colour:** 24h % and funding rate are green or red by sign. Mark price is drawn plain, since it moves every second for every symbol. TradFi contracts are cyan, commodities (gold, silver, platinum, palladium, copper, crude, Brent, natural gas) orange.
+- **Volume surge glow:** the background behind a symbol's name turns yellow when its traded volume surges. Brightness is continuous, not on/off: it compares the volume rate over the last 10–20 seconds with the average rate over the rest of the last 15 minutes, starts as dark amber at 2x and reaches bright yellow at 16x (log scale, 24-bit colour where the terminal supports it, a five-step 256-colour ramp otherwise). It fades as the burst ends, and a sustained higher rate fades too as the 15-minute average catches up. Nothing glows for the first two minutes after start, while the baseline builds. The stream has no per-interval volume, so this is derived from changes in the rolling 24h quote volume, corrected for what is expected to drop out of the 24h window; it is an estimate, and bursts under $5K are ignored.
 - **Header:** any active prompt or filter, connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
+- **Open interest (`OI`, detail level 3 and up):** each symbol's open interest value in USD. Its background runs from red to green by how far it sits from its own one-hour average: green when positions are being added, red when they are being closed, full colour at 5% either way. The header shows the total for the current tab (all, TradFi, crypto, commodities, or whatever a filter leaves), with `(fetched/total)` while some symbols are still to be fetched.
 - **TradFi sessions:** whether each underlying market (US equities, commodities, FX, Korea, Hong Kong, China) is open, in pre/post-market, overnight or closed, with the time left in that state.
-- **Footer:** recent liquidations.
+- **Footer (liquidation flow):** two lines, shorts liquidated above (green) and longs liquidated below (red), in USD notional.
+  - Rolling totals over 1 minute, 5 minutes and 1 hour.
+  - A surge ratio: the last minute against that side's own average minute over the rest of the hour (`x1.0` is normal). When a side takes $1M or more in a minute at 5x its norm, its label is highlighted.
+  - A mirrored timeline, one column per 10 seconds, newest on the right. Shorts grow up and longs hang down from a shared axis on one square-root scale; the label on the lower line is the notional of a full-height bar. A cascade shows as a block of tall bars on one side, and its end as the bars thinning out.
+  - Columns holding a single liquidation of $1M or more are drawn in a deeper colour, as are those symbols and prints on the right.
+  - On the right, the symbols hit hardest over the last 5 minutes; `l` switches this to the latest prints with their prices.
+
+  Binance pushes at most one liquidation per symbol per second on this stream, so totals are a lower bound during heavy cascades. Recording starts when the program starts.
 
 Row order is frozen between re-rankings so values update in place and rows stay readable. During the first 20 seconds after connecting the order still shifts, because the ticker stream only sends symbols that have changed.
 
@@ -89,7 +101,8 @@ Row order is frozen between re-rankings so values update in place and rows stay 
 Press `f`, type a symbol and press Enter to pin it; do the same again to unpin. Names are accepted as shown on screen (`BTC`) or in full (`BTCUSDT`), and several can be given at once, separated by commas.
 
 - Pinned symbols are marked with a yellow `*` and always lead the first page, whatever the sort. The sort still orders them among themselves.
-- `F` narrows every view to your pinned symbols, including the plot and the histograms.
+- `F` cycles three states: pinned first (the default), pinned only, and hidden. Pinned only narrows every view to your pinned symbols, including the plot and the histograms.
+- Hidden turns the feature off without losing the list: pinned symbols go back to their normal place in the sort, with no marker. `--hide-pins` starts in this state.
 - In the history plot, pinned symbols are always drawn, and the remaining lines are filled by volume.
 - The list is saved to `~/.config/tickerterm/favorites.txt` (or `$XDG_CONFIG_HOME`), one full symbol per line, and is loaded on the next start. It is a plain text file, so you can edit it by hand.
 
@@ -115,6 +128,13 @@ Binance pushes these streams once per second, which is the floor for any client.
 Background work stays off that path: history is sampled after each frame is on screen, the funding fetch runs on its own thread, and the visualisations are recomputed once per second rather than per message.
 
 The header shows both the exchange-to-receive delay and the receive-to-screen time, which is typically a few hundred microseconds.
+
+## Open interest and commodities
+
+Neither is on the WebSocket streams, so a background thread fetches them over REST and caches them in `~/.cache/tickerterm/`:
+
+- **Commodities** come from `GET /fapi/v1/exchangeInfo` (`underlyingType` = `COMMODITY`), cached in `symbols.txt` and refreshed hourly.
+- **Open interest** comes from `GET /futures/data/openInterestHist` (`sumOpenInterestValue`), which answers for one symbol per request and is limited to 1000 requests per 5 minutes per IP. With about 800 contracts, the poller walks them busiest first at 1.5 requests a second (45% of the limit; 2.5 a second for the first pass), so each value is refreshed roughly every 9 minutes. Each request asks for the last 13 five-minute points: the newest is the value shown and the 12 before it are its one-hour average. Values are cached in `open_interest.txt` with their fetch time, so a restart shows them at once and does not re-request anything fetched in the last 5 minutes. On a 429 or 418 the poller pauses for the time Binance asks.
 
 ## Data sources
 

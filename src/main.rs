@@ -7,11 +7,14 @@
 mod favorites;
 mod funding;
 mod history;
+mod liq;
+mod oi;
+mod surge;
 mod views;
 
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -105,8 +108,6 @@ struct ForceOrder<'a> {
     p: &'a str,
     #[serde(borrow, default)]
     ap: &'a str,
-    #[serde(rename = "T", default)]
-    t: u64,
 }
 
 #[derive(Deserialize)]
@@ -166,15 +167,12 @@ struct Row {
     fint: u8,
     pinned: bool,
     tradfi: bool,
+    /// underlying is a commodity (from exchangeInfo); every commodity is also TradFi
+    commodity: bool,
+    /// open interest value in USD and its one-hour average (0 until fetched)
+    oi: f64,
+    oi_ma: f64,
     usdt_perp: bool,
-}
-
-struct Liq {
-    t: u64,
-    sym: String,
-    sell: bool,
-    notional: f64,
-    price: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -207,14 +205,19 @@ fn passes(r: &Row, market: u8, class: u8, pin_only: bool, filter: &str) -> bool 
     r.has_tick
         && (!pin_only || r.pinned)
         && (market == 1 || (r.usdt_perp && r.st != 2))
-        && (class == 0 || (class == 1) == r.tradfi)
+        && match class {
+            1 => r.tradfi,
+            2 => !r.tradfi,
+            3 => r.commodity,
+            _ => true,
+        }
         && (filter.is_empty() || r.sym.contains(filter))
 }
 
 /// Visible cell width per detail level (without the 2-char gutter).
-const CW: [usize; 5] = [33, 48, 55, 68, 119];
+const CW: [usize; 5] = [33, 48, 62, 75, 126];
 const HDR_LINES: usize = 5; // 3 status lines + sessions + column header
-const FIXED: usize = 6; // + footer
+const FIXED: usize = 7; // + two footer lines (liquidation flow)
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -250,7 +253,17 @@ impl Stat {
 struct App {
     rows: Vec<Row>,
     index: HashMap<String, usize>,
-    liqs: VecDeque<Liq>,
+    flow: liq::Flow,
+    vols: surge::Vols,
+    commodities: HashSet<String>,
+    oi_map: HashMap<String, (f64, f64)>,
+    oi_note: String,
+    truecolor: bool,
+    /// footer lines, their cache key, per-symbol scratch, and whether the right side shows the tape
+    flines: [Vec<u8>; 2],
+    fkey: (u64, usize, bool),
+    ftops: Vec<(u32, f64, bool)>,
+    tape: bool,
     sessions: Vec<Sess>,
     tseq: u64,
     // view
@@ -265,7 +278,8 @@ struct App {
     in_rank: Vec<bool>,
     // favourites
     pins: HashSet<String>,
-    pin_only: bool,
+    /// 0 = pinned symbols lead the page, 1 = pinned only, 2 = favourites hidden (pins ignored, list kept)
+    pin_mode: u8,
     pinning: bool,
     pin_buf: Vec<u8>,
     notice: String,
@@ -394,7 +408,16 @@ impl App {
         App {
             rows: Vec::with_capacity(1024),
             index: HashMap::with_capacity(1024),
-            liqs: VecDeque::new(),
+            flow: liq::Flow::new(now_ms()),
+            vols: surge::Vols::new(now_ms()),
+            commodities: HashSet::new(),
+            oi_map: HashMap::with_capacity(1024),
+            oi_note: String::new(),
+            truecolor: std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit")),
+            flines: [Vec::new(), Vec::new()],
+            fkey: (u64::MAX, 0, false),
+            ftops: Vec::new(),
+            tape: false,
             sessions: Vec::new(),
             tseq: 0,
             sort: 0,
@@ -407,7 +430,7 @@ impl App {
             rerank_secs: 60,
             in_rank: Vec::new(),
             pins: favorites::load(),
-            pin_only: false,
+            pin_mode: 0,
             pinning: false,
             pin_buf: Vec::new(),
             notice: String::new(),
@@ -489,6 +512,9 @@ impl App {
                     pinned: self.pins.contains(sym),
                     fint: self.fund_hours.get(sym).copied().unwrap_or(funding::DEFAULT_HOURS),
                     tradfi: false,
+                    commodity: self.commodities.contains(sym),
+                    oi: self.oi_map.get(sym).map_or(0.0, |v| v.0),
+                    oi_ma: self.oi_map.get(sym).map_or(0.0, |v| v.1),
                     usdt_perp: sym.ends_with("USDT") && !sym.contains('_'),
                 });
                 self.index.insert(sym.to_string(), i);
@@ -532,6 +558,25 @@ impl App {
         self.hist.push(now, now_ms(), rows.len(), |i| if rows[i].has_tick { rows[i].chg as f32 } else { f32::NAN });
     }
 
+    fn on_rest(&mut self, msg: oi::Msg) {
+        match msg {
+            oi::Msg::Commodities(list) => {
+                self.commodities = list.into_iter().collect();
+                for r in &mut self.rows {
+                    r.commodity = self.commodities.contains(&r.sym);
+                }
+                self.rank_dirty |= self.class == 3;
+            }
+            oi::Msg::Oi(sym, val, ma) => {
+                if let Some(&i) = self.index.get(&sym) {
+                    (self.rows[i].oi, self.rows[i].oi_ma) = (val, ma);
+                }
+                self.oi_map.insert(sym, (val, ma));
+            }
+            oi::Msg::Note(n) => self.oi_note = n,
+        }
+    }
+
     fn set_funding(&mut self, res: Result<funding::Hours, String>, at: SystemTime) {
         match res {
             Ok(hours) => {
@@ -567,9 +612,15 @@ impl App {
             self.tseq += 1;
             let seq = self.tseq;
             self.win_upd += v.len() as u64;
+            self.vols.advance(wall);
             for t in &v {
                 ev = ev.max(t.ev);
                 let r = self.row(t.s, now);
+                // Volume traded since this symbol's last push: the change in rolling 24h quote volume,
+                // plus what is expected to have dropped out of the far end of the window meanwhile.
+                let q = pf(t.q);
+                let dt = now.duration_since(r.at).as_secs_f64();
+                let traded = if r.has_tick && dt < 30.0 { (q - r.qvol + r.qvol * dt / 86400.0).max(0.0) } else { 0.0 };
                 let last = pf(t.c);
                 if r.has_tick && last != r.last {
                     r.dir = if last > r.last { 1 } else { -1 };
@@ -591,6 +642,10 @@ impl App {
                 r.has_tick = true;
                 r.seq = seq;
                 r.at = now;
+                if traded > 0.0 {
+                    let i = self.index[t.s];
+                    self.vols.add(i, traded);
+                }
             }
         } else if stream.starts_with("!markPrice") {
             let v: Vec<Mark> = serde_json::from_str(data)?;
@@ -625,14 +680,11 @@ impl App {
             let f: Force = serde_json::from_str(data)?;
             ev = f.ev;
             let px = if pf(f.o.ap) > 0.0 { f.o.ap } else { f.o.p };
-            self.liqs.push_front(Liq {
-                t: f.o.t,
-                sym: f.o.s.to_string(),
-                sell: f.o.side == "SELL",
-                notional: pf(f.o.q) * pf(px),
-                price: px.to_string(),
-            });
-            self.liqs.truncate(64);
+            self.row(f.o.s, now);
+            let row = self.index[f.o.s] as u32;
+            // a forced SELL closes a long, a forced BUY closes a short
+            let side = if f.o.side == "SELL" { liq::LONGS } else { liq::SHORTS };
+            self.flow.add(wall, row, side, pf(f.o.q) * pf(px), px);
         }
         if ev > 0 {
             self.net.add(wall as f64 - ev as f64);
@@ -739,7 +791,7 @@ impl App {
                 }
                 b'r' => self.rank_dirty = true,
                 b't' => {
-                    self.class = (self.class + 1) % 3;
+                    self.class = (self.class + 1) % 4;
                     self.page = 0;
                     self.rank_dirty = true;
                 }
@@ -756,11 +808,12 @@ impl App {
                     self.pin_buf.clear();
                 }
                 b'F' => {
-                    self.pin_only = !self.pin_only;
+                    self.pin_mode = (self.pin_mode + 1) % 3;
                     self.page = 0;
                     self.rank_dirty = true;
                 }
                 b'?' | b'h' => self.help = !self.help,
+                b'l' => self.tape = !self.tape,
                 b'p' => self.view = if self.view == View::Plot { View::Board } else { View::Plot },
                 b'd' => self.view = if self.view == View::Dist { View::Board } else { View::Dist },
                 b'b' => self.view = View::Board,
@@ -782,7 +835,8 @@ impl App {
 
         // ---- membership + ranking. The order is frozen between re-ranks so rows hold still:
         // values update in place, positions only move on a re-rank.
-        let (market, class, pin_only) = (self.market, self.class, self.pin_only);
+        let (market, class, pin_only) = (self.market, self.class, self.pin_mode == 1);
+        let show_pins = self.pin_mode != 2;
         self.order.retain(|&i| passes(&self.rows[i as usize], market, class, pin_only, &self.filter));
         self.in_rank.clear();
         self.in_rank.resize(self.rows.len(), false);
@@ -804,7 +858,7 @@ impl App {
             self.order.sort_unstable_by(|&a, &b| {
                 let (x, y) = (&rows[a as usize], &rows[b as usize]);
                 // pinned symbols lead the page whatever the sort; the sort orders them among themselves
-                y.pinned.cmp(&x.pinned).then(match key {
+                (show_pins && y.pinned).cmp(&(show_pins && x.pinned)).then(match key {
                     Sort::Vol => y.qvol.total_cmp(&x.qvol),
                     Sort::ChgDesc => y.chg.total_cmp(&x.chg),
                     Sort::ChgAsc => x.chg.total_cmp(&y.chg),
@@ -818,9 +872,12 @@ impl App {
             self.ranked_at = t0;
         }
         let (mut adv, mut dec, mut flat, mut vol, mut ntf) = (0u32, 0u32, 0u32, 0f64, 0u32);
+        let (mut oi_sum, mut oi_n) = (0f64, 0u32);
         for &i in &self.order {
             let r = &self.rows[i as usize];
             ntf += r.tradfi as u32;
+            oi_sum += r.oi;
+            oi_n += (r.oi > 0.0) as u32;
             if r.st != 2 {
                 vol += r.qvol;
             }
@@ -877,8 +934,10 @@ impl App {
         if self.filtering || !self.filter.is_empty() {
             let _ = write!(s, " | \x1b[1;33m/{}{}\x1b[0m", self.filter, if self.filtering { "_" } else { "" });
         }
-        if self.pin_only {
-            s.extend_from_slice(b" | \x1b[1;33m* PINNED ONLY\x1b[0m");
+        match self.pin_mode {
+            1 => s.extend_from_slice(b" | \x1b[1;33m* PINNED ONLY\x1b[0m"),
+            2 => s.extend_from_slice(b" | \x1b[2mfavourites hidden\x1b[0m"),
+            _ => {}
         }
         let _ = write!(
             s,
@@ -892,11 +951,24 @@ impl App {
             flat
         );
         hum(s, vol, 0);
+        // open interest summed over the symbols of this tab; flagged while some are still to be fetched
+        s.extend_from_slice(b" | OI ");
+        if oi_n == 0 {
+            s.push(b'-');
+        } else {
+            hum(s, oi_sum, 0);
+            if (oi_n as usize) < n {
+                let _ = write!(s, "\x1b[2m ({}/{})\x1b[0m", oi_n, n);
+            }
+        }
+        if !self.oi_note.is_empty() {
+            let _ = write!(s, " \x1b[33m{}\x1b[0m", self.oi_note);
+        }
         let _ = write!(
             s,
             " | {}{} | sort {} ({}s ago) | lvl {}{} | pg {}/{}",
             ["USDT-PERP", "ALL"][self.market as usize],
-            ["", " TRADFI", " CRYPTO"][self.class as usize],
+            ["", " TRADFI", " CRYPTO", " COMMODITIES"][self.class as usize],
             SORTS[self.sort].1,
             t0.duration_since(self.ranked_at).as_secs(),
             level + 1,
@@ -1017,7 +1089,7 @@ impl App {
                 let _ = write!(s, " {:>8} {:>5}", "FUND/yr%", "NEXT");
             }
             if level >= 2 {
-                let _ = write!(s, " {:>6}", "QVOL");
+                let _ = write!(s, " {:>6} {:>6}", "QVOL", "OI");
             }
             if level >= 3 {
                 let _ = write!(s, " {:>6} {:5}", "TRADES", "L<->H");
@@ -1041,7 +1113,7 @@ impl App {
             match self.order.get(base + slot) {
                 Some(&i) => {
                     let r = &self.rows[i as usize];
-                    cell(s, r, level, sw, wall, now.duration_since(r.at).as_secs() > 60);
+                    cell(s, r, level, sw, wall, now.duration_since(r.at).as_secs() > 60, show_pins && r.pinned, self.vols.level(i as usize, wall), self.truecolor);
                 }
                 None => {
                     s.extend_from_slice(b"\x1b[0m");
@@ -1052,37 +1124,20 @@ impl App {
             emit(&mut self.out, &mut self.prev[FIXED + slot], s, HDR_LINES + 1 + row, col * (cw(level) + 2) + 1, false);
         }
 
-        // ---- footer: liquidation tape / help
-        let s = &mut self.scratch;
-        s.clear();
-        if self.help || self.liqs.is_empty() {
-            s.extend_from_slice(
-                b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/both | f pin/unpin | F pinned only | p plot | d distributions | 1-5 detail, a auto | / filter (esc clears) | arrows/j/k page | ? liq tape\x1b[0m",
-            );
+        // ---- footer: liquidation flow (shorts above, longs below) / help
+        if self.help || !self.flow.seen {
+            const HELP: [&[u8]; 2] = [
+                b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/commodities/both | f pin/unpin | F pins first/only/hidden | 1-5 detail, a auto | / filter (esc clears)\x1b[0m",
+                b"\x1b[0;2m p plot | d distributions | arrows/j/k page | l liquidations: 5m totals by symbol / latest prints | ? liquidation flow\x1b[0m",
+            ];
+            emit(&mut self.out, &mut self.prev[5], HELP[0], h.max(FIXED) - 1, 1, true);
+            emit(&mut self.out, &mut self.prev[4], HELP[1], h.max(FIXED), 1, true);
         } else {
-            s.extend_from_slice(b"\x1b[0;1m LIQ\x1b[0m");
-            let mut used = 4;
-            for l in &self.liqs {
-                let sym = l.sym.strip_suffix("USDT").unwrap_or(&l.sym);
-                let need = 9 + sym.chars().map(wide).sum::<usize>() + 6 + 6 + l.price.len() + 5;
-                if used + need > w {
-                    break;
-                }
-                used += need;
-                s.push(b' ');
-                hms(s, l.t, false);
-                let _ = write!(
-                    s,
-                    " {}{} {}",
-                    if l.sell { "\x1b[31m" } else { "\x1b[32m" },
-                    sym,
-                    if l.sell { "SELL" } else { "BUY " }
-                );
-                hum(s, l.notional, 6);
-                let _ = write!(s, " @{}\x1b[0m |", l.price);
-            }
+            self.flow.advance(wall);
+            self.draw_flow(w);
+            emit(&mut self.out, &mut self.prev[5], &self.flines[liq::SHORTS], h.max(FIXED) - 1, 1, true);
+            emit(&mut self.out, &mut self.prev[4], &self.flines[liq::LONGS], h.max(FIXED), 1, true);
         }
-        emit(&mut self.out, &mut self.prev[4], s, h.max(FIXED), 1, true);
 
         self.out.extend_from_slice(b"\x1b[?2026l");
         let t1 = Instant::now();
@@ -1124,7 +1179,43 @@ fn mark_disp<'a>(mark: &'a str, last: &str) -> &'a str {
     &mark[..if d == 0 { p } else { (p + 1 + d).min(mark.len()) }]
 }
 
-fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: bool) {
+/// Background for a volume surge of brightness `g` (1..=surge::STEPS): dark amber up to bright yellow,
+/// with black text once it is bright enough to need it.
+fn glow(s: &mut Vec<u8>, g: u8, truecolor: bool) {
+    let x = g as f32 / surge::STEPS as f32;
+    if truecolor {
+        let _ = write!(s, "\x1b[48;2;{};{};0m", (60.0 + 195.0 * x) as u8, (45.0 + 175.0 * x) as u8);
+    } else {
+        // the yellow diagonal of the 256-colour cube
+        const RAMP: [u8; 5] = [58, 100, 142, 184, 226];
+        let _ = write!(s, "\x1b[48;5;{}m", RAMP[((x * 5.0).ceil() as usize).clamp(1, 5) - 1]);
+    }
+    if x > 0.45 {
+        s.extend_from_slice(b"\x1b[22;30m");
+    }
+}
+
+/// Background for open interest `dev` away from its one-hour average (0.05 = 5% above): green when
+/// positions are being added, red when they are being closed, full colour at 5% either way.
+fn oi_bg(s: &mut Vec<u8>, dev: f64, truecolor: bool) {
+    const STEPS: f64 = 10.0;
+    let k = ((dev.abs() / 0.05).min(1.0) * STEPS).round();
+    if k == 0.0 {
+        return;
+    }
+    let x = k / STEPS;
+    if truecolor {
+        let (hi, lo) = ((40.0 + 150.0 * x) as u8, (10.0 * (1.0 - x)) as u8);
+        let _ = if dev > 0.0 { write!(s, "\x1b[48;2;{lo};{hi};{lo}m") } else { write!(s, "\x1b[48;2;{hi};{lo};{lo}m") };
+    } else {
+        const RAMP: [[u8; 5]; 2] = [[22, 28, 34, 40, 46], [52, 88, 124, 160, 196]];
+        let _ = write!(s, "\x1b[48;5;{}m", RAMP[(dev < 0.0) as usize][((x * 5.0).ceil() as usize).clamp(1, 5) - 1]);
+    }
+    s.extend_from_slice(if x > 0.7 && (!truecolor || dev > 0.0) { b"\x1b[30m" } else { b"\x1b[97m" });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: bool, pin: bool, surge: u8, truecolor: bool) {
     let sgr = |s: &mut Vec<u8>, sign: f64, _bold: bool| {
         s.extend_from_slice(match (stale, sign > 0.0, sign < 0.0) {
             (true, ..) => b"\x1b[0;2m" as &[u8],
@@ -1133,23 +1224,23 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
             _ => b"\x1b[0m",
         })
     };
-    s.extend_from_slice(match (stale, r.tradfi) {
-        (true, true) => b"\x1b[0;2;36m" as &[u8],
-        (true, false) => b"\x1b[0;2m",
-        (false, true) => b"\x1b[0;36m",
-        _ => b"\x1b[0m",
-    });
+    // crypto plain, TradFi cyan, commodities orange
+    let kind = if r.commodity { 2 } else { r.tradfi as usize };
+    const NAME: [[&[u8]; 3]; 3] = [
+        [b"\x1b[0m", b"\x1b[0;36m", b"\x1b[0;38;5;214m"],
+        [b"\x1b[0;1m", b"\x1b[0;1;36m", b"\x1b[0;1;38;5;214m"],
+        [b"\x1b[0;2m", b"\x1b[0;2;36m", b"\x1b[0;2;38;5;214m"],
+    ];
+    s.extend_from_slice(NAME[if stale { 2 } else { 0 }][kind]);
     // pad by terminal columns: CJK tickers are two columns per character
     let mut used = 0;
-    if r.pinned {
+    if pin {
         s.extend_from_slice(if stale { b"\x1b[0;2;33m*" } else { b"\x1b[0;1;33m*" });
-        s.extend_from_slice(match (stale, r.tradfi) {
-            (true, true) => b"\x1b[0;2;36m" as &[u8],
-            (true, false) => b"\x1b[0;2m",
-            (false, true) => b"\x1b[0;1;36m",
-            _ => b"\x1b[0;1m",
-        });
+        s.extend_from_slice(NAME[if stale { 2 } else { 1 }][kind]);
         used = 1;
+    }
+    if surge > 0 && !stale {
+        glow(s, surge, truecolor);
     }
     for ch in disp(r).chars() {
         let cwid = wide(ch);
@@ -1159,6 +1250,10 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
         used += cwid;
         let mut u = [0u8; 4];
         s.extend_from_slice(ch.encode_utf8(&mut u).as_bytes());
+    }
+    // the glow covers the name only, not its padding, so neighbouring columns stay clean
+    if surge > 0 && !stale {
+        s.extend_from_slice(b"\x1b[0m");
     }
     s.resize(s.len() + sw - used + 1, b' ');
     // Mark price, cut to the contract's tick precision and drawn plain: it moves every second
@@ -1214,6 +1309,16 @@ fn cell(s: &mut Vec<u8>, r: &Row, level: usize, sw: usize, wall: u64, stale: boo
     if level >= 2 {
         s.extend_from_slice(plain);
         hum(s, r.qvol, 6);
+        s.extend_from_slice(plain);
+        if r.oi > 0.0 {
+            if !stale && r.oi_ma > 0.0 {
+                oi_bg(s, r.oi / r.oi_ma - 1.0, truecolor);
+            }
+            hum(s, r.oi, 6);
+            s.extend_from_slice(if stale { b"\x1b[0;2m" } else { b"\x1b[0m" });
+        } else {
+            s.extend_from_slice(b"     -");
+        }
     }
     if level >= 3 {
         s.push(b' ');
@@ -1332,6 +1437,7 @@ fn main() {
     let mut url = DEFAULT_URL.to_string();
     let mut dump = 0usize;
     let mut all = false;
+    let mut hide_pins = false;
     let mut class = 0u8;
     let mut rerank = 60u64;
     let mut args = std::env::args().skip(1);
@@ -1339,15 +1445,18 @@ fn main() {
         match a.as_str() {
             "--url" => url = args.next().expect("--url needs a value"),
             "--all" => all = true,
+            "--hide-pins" => hide_pins = true,
             "--tradfi" => class = 1,
             "--crypto" => class = 2,
+            "--commodities" => class = 3,
             "--rerank" => rerank = args.next().and_then(|v| v.parse().ok()).expect("--rerank needs seconds"),
             "--dump" => dump = args.next().and_then(|v| v.parse().ok()).unwrap_or(6),
             _ => {
                 eprintln!(
-                    "usage: tickerterm [--all] [--tradfi | --crypto] [--rerank SECS] [--url wss://...] [--dump N]\n  \
+                    "usage: tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank SECS] [--url wss://...] [--dump N]\n  \
                      --all      start with every symbol (default: USDT perpetuals only)\n  \
                      --tradfi   start on the TradFi-only page (--crypto for the opposite; 't' cycles)\n  \
+                     --hide-pins  start with favourites hidden ('F' cycles first / only / hidden)\n  \
                      --rerank   seconds between re-rankings, 0 = only on 'r' (default 60)\n  \
                      default url: {DEFAULT_URL}"
                 );
@@ -1392,8 +1501,10 @@ fn main() {
         app.set_funding(Ok(hours), at);
     }
     let funding_rx = funding::spawn(first_fetch);
+    let rest_rx = oi::spawn();
     app.market = all as u8;
     app.class = class;
+    app.pin_mode = if hide_pins { 2 } else { 0 };
     app.rerank_secs = rerank;
     let mut conn: Option<(Ws, TcpStream)> = None;
     let mut next_try = Instant::now();
@@ -1441,6 +1552,10 @@ fn main() {
         let mut dirty = rc < 0 || WINCH.load(Ordering::Relaxed); // EINTR: resize
         if let Ok(res) = funding_rx.try_recv() {
             app.set_funding(res, SystemTime::now());
+        }
+        while let Ok(msg) = rest_rx.try_recv() {
+            app.on_rest(msg);
+            dirty = true;
         }
 
         if fds[0].revents != 0 {
