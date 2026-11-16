@@ -226,8 +226,8 @@ fn passes(r: &Row, market: u8, class: u8, pin_only: bool, filter: &str) -> bool 
 
 /// Visible cell width per detail level (without the 2-char gutter).
 const CW: [usize; 5] = [44, 59, 73, 86, 126];
-const HDR_LINES: usize = 6; // 3 status lines + sessions + USDC/USDT spot + column header
-const FIXED: usize = 8; // + two footer lines (liquidation flow)
+const HDR_LINES: usize = 7; // 3 status lines + sessions + two spot pairs + column header
+const FIXED: usize = 9; // + two footer lines (liquidation flow)
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -235,6 +235,7 @@ enum View {
     Plot,
     Dist,
     Arb,
+    Btc,
 }
 
 #[derive(Default)]
@@ -269,11 +270,15 @@ struct App {
     commodities: HashSet<String>,
     oi_map: HashMap<String, (f64, f64)>,
     oi_note: String,
-    usdc: spot::Book,
+    spot: spot::Snapshot,
+    btc_sort: usize,
+    btc_page: usize,
     hl_gen: u64,
     hl_at: Option<Instant>,
     hl_err: String,
     arb_sort: usize,
+    /// page of the arbitrage table, scrolled separately from the board
+    arb_page: usize,
     truecolor: bool,
     /// footer lines, their cache key, per-symbol scratch, and whether the right side shows the tape
     flines: [Vec<u8>; 2],
@@ -429,11 +434,14 @@ impl App {
             commodities: HashSet::new(),
             oi_map: HashMap::with_capacity(1024),
             oi_note: String::new(),
-            usdc: spot::Book::default(),
+            spot: spot::Snapshot::default(),
+            btc_sort: 0,
+            btc_page: 0,
             hl_gen: 1,
             hl_at: None,
             hl_err: String::new(),
             arb_sort: 0,
+            arb_page: 0,
             truecolor: std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit")),
             flines: [Vec::new(), Vec::new()],
             fkey: (u64::MAX, 0, false),
@@ -793,9 +801,9 @@ impl App {
                         let seq = &b[st..(i + 1).min(b.len())];
                         i += 1;
                         match seq {
-                            b"A" | b"D" | b"5~" => self.page = self.page.saturating_sub(1),
-                            b"B" | b"C" | b"6~" => self.page += 1,
-                            b"H" | b"1~" => self.page = 0,
+                            b"A" | b"D" | b"5~" => *self.pg() = self.pg().saturating_sub(1),
+                            b"B" | b"C" | b"6~" => *self.pg() += 1,
+                            b"H" | b"1~" => *self.pg() = 0,
                             _ => {}
                         }
                     } else if self.view != View::Board {
@@ -807,7 +815,14 @@ impl App {
                     }
                 }
                 b'q' | b'Q' => return true,
-                b's' | b'S' if self.view == View::Arb => self.arb_sort = (self.arb_sort + 1) % hl::ARB_SORTS.len(),
+                b's' | b'S' if self.view == View::Btc => {
+                    self.btc_sort = (self.btc_sort + 1) % spot::BTC_SORTS.len();
+                    self.btc_page = 0;
+                }
+                b's' | b'S' if self.view == View::Arb => {
+                    self.arb_sort = (self.arb_sort + 1) % hl::ARB_SORTS.len();
+                    self.arb_page = 0;
+                }
                 b's' => {
                     self.sort = (self.sort + 1) % SORTS.len();
                     self.page = 0;
@@ -846,16 +861,26 @@ impl App {
                 b'p' => self.view = if self.view == View::Plot { View::Board } else { View::Plot },
                 b'd' => self.view = if self.view == View::Dist { View::Board } else { View::Dist },
                 b'A' => self.view = if self.view == View::Arb { View::Board } else { View::Arb },
+                b'B' => self.view = if self.view == View::Btc { View::Board } else { View::Btc },
                 b'b' => self.view = View::Board,
                 b'x' => self.plot_rebase = !self.plot_rebase,
                 b'z' => self.plot_full = !self.plot_full,
-                b'j' | b' ' => self.page += 1,
-                b'k' => self.page = self.page.saturating_sub(1),
-                b'g' => self.page = 0,
+                b'j' | b' ' => *self.pg() += 1,
+                b'k' => *self.pg() = self.pg().saturating_sub(1),
+                b'g' => *self.pg() = 0,
                 _ => {}
             }
         }
         false
+    }
+
+    /// The page the paging keys move: the arbitrage table has its own.
+    fn pg(&mut self) -> &mut usize {
+        match self.view {
+            View::Arb => &mut self.arb_page,
+            View::Btc => &mut self.btc_page,
+            _ => &mut self.page,
+        }
     }
 
     fn render(&mut self, fd: i32) {
@@ -1041,6 +1066,7 @@ impl App {
                 match self.view {
                     View::Plot => self.draw_plot(w, nl, pick),
                     View::Arb => self.draw_arb(w, nl),
+                    View::Btc => self.draw_btc(w, nl),
                     _ => self.draw_dist(w, nl),
                 }
                 // cost of recomputing the view, shown at the end of its key line
@@ -1111,12 +1137,14 @@ impl App {
         }
         emit(&mut self.out, &mut self.prev[FIXED - 1], s, 4, 1, true);
 
-        // ---- line 5: USDC/USDT spot best bid and ask, pinned above the grid
-        s.clear();
-        spot::line(s, &self.usdc, hum);
-        emit(&mut self.out, &mut self.prev[6], s, 5, 1, true);
+        // ---- lines 5-6: rolling window statistics of the spot pairs, pinned above the grid
+        for (i, t) in self.spot.pins.iter().enumerate() {
+            s.clear();
+            spot::line(s, i, t, hum);
+            emit(&mut self.out, &mut self.prev[6 + i], s, 5 + i, 1, true);
+        }
 
-        // ---- line 5: column headers
+        // ---- line 7: column headers
         s.clear();
         s.extend_from_slice(b"\x1b[0;7m");
         for c in 0..ncols {
@@ -1164,7 +1192,7 @@ impl App {
         if self.help || !self.flow.seen {
             const HELP: [&[u8]; 2] = [
                 b"\x1b[0;2m q quit | s/S sort | r re-rank now | m usdt-perp/all | t tradfi/crypto/commodities/both | f pin/unpin | F pins first/only/hidden | 1-5 detail, a auto | / filter (esc clears)\x1b[0m",
-                b"\x1b[0;2m p plot | d distributions | A funding arbitrage vs Hyperliquid | arrows/j/k page | l liquidations: 5m totals by symbol / latest prints | ? liquidation flow\x1b[0m",
+                b"\x1b[0;2m p plot | d distributions | A funding arbitrage vs Hyperliquid | B BTC spot markets | arrows/j/k page | l liquidations: 5m totals by symbol / latest prints | ? liquidation flow\x1b[0m",
             ];
             emit(&mut self.out, &mut self.prev[5], HELP[0], h.max(FIXED) - 1, 1, true);
             emit(&mut self.out, &mut self.prev[4], HELP[1], h.max(FIXED), 1, true);
@@ -1547,7 +1575,7 @@ fn main() {
     let funding_rx = funding::spawn(first_fetch);
     let rest_rx = oi::spawn();
     let hl_rx = hl::spawn();
-    let usdc = spot::spawn();
+    let spot_feed = spot::spawn();
     app.market = all as u8;
     app.class = class;
     app.pin_mode = if hide_pins { 2 } else { 0 };
@@ -1592,7 +1620,7 @@ fn main() {
                 events: libc::POLLIN,
                 revents: 0,
             },
-            libc::pollfd { fd: usdc.wake_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: spot_feed.wake_fd, events: libc::POLLIN, revents: 0 },
         ];
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), 3, 1000) };
         let t_rx = Instant::now();
@@ -1600,9 +1628,12 @@ fn main() {
         if let Ok(res) = funding_rx.try_recv() {
             app.set_funding(res, SystemTime::now());
         }
-        if let Some(book) = usdc.take() {
-            app.usdc = book;
-            dirty |= app.view == View::Board;
+        if let Some(ticks) = spot_feed.take() {
+            app.spot = ticks;
+            if app.view == View::Btc {
+                app.view_dirty = true;
+            }
+            dirty |= app.view == View::Board || app.view == View::Btc;
         }
         if let Ok(res) = hl_rx.try_recv() {
             app.on_hl(res);

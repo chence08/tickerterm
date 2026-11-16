@@ -67,7 +67,8 @@ tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank
 | `1`–`5`, `a` | Detail level, or auto |
 | `p` | 24h% history plot (`x` absolute / change since start, `z` p1–p99 / full range) |
 | `d` | Distribution histograms |
-| `A` | Funding arbitrage against Hyperliquid (`s` cycles its sort) |
+| `A` | Funding arbitrage against Hyperliquid (`s` cycles its sort, arrows `j` `k` page through it) |
+| `B` | BTC-quoted spot markets (`s` cycles its sort, arrows `j` `k` page through it) |
 | `f` | Pin or unpin: type one or more names (`btc` or `btc,eth,sol`) and press Enter |
 | `F` | Cycle favourites: pinned first, pinned only, hidden |
 | `/` | Filter by symbol (Esc clears) |
@@ -86,7 +87,8 @@ tickerterm [--all] [--tradfi | --crypto | --commodities] [--hide-pins] [--rerank
 - **Header:** any active prompt or filter, connection state, advancers and decliners, total 24h volume, top movers, measured latency and message rates.
 - **VWAP:** the 24h volume-weighted average price, always shown. Its background is green when VWAP is below the mark price and red when it is above, in ten shades by the percentage gap: no colour within 0.25%, full colour at 5%.
 - **Open interest (`OI`, detail level 3 and up):** each symbol's open interest value in USD. Its background runs from red to green by how far it sits from its own one-hour average: green when positions are being added, red when they are being closed, full colour at 5% either way. The header shows the total for the current tab (all, TradFi, crypto, commodities, or whatever a filter leaves), with `(fetched/total)` while some symbols are still to be fetched.
-- **USDC/USDT spot:** a line pinned above the grid with the best bid and ask of USDC/USDT on Binance spot and their sizes, the spread, the mid against 1.0000 in basis points, how the size at the touch is split between bid and ask, and the order book update id. It comes from the spot `usdcusdt@bookTicker` stream on its own connection and redraws as the quote changes.
+- **Spot pairs:** two lines pinned above the grid, one for USDC/USDT and one for ETH/BTC on Binance spot, each showing the trailing 24-hour window: last price, change in percent and in price, open, high, low, volume-weighted average price, volume in both assets and the number of trades. They come from the spot all-market rolling window ticker stream (`!ticker_1d@arr`) on its own connection.
+- **BTC markets (`B`):** a table of every BTC-quoted pair on Binance spot from the same stream: last, change, high, low and VWAP in BTC, volume in BTC and in dollars (at spot BTC/USDT), and trades, all over the trailing 24 hours. `s` cycles the sort (volume, change down, change up, name), the arrows and `j`/`k` page, `/` filters. The stream only mentions a pair when it trades, so the table is filled at start-up from `GET /api/v3/ticker/24hr`; pairs with no trade in the window are left out.
 - **TradFi sessions:** whether each underlying market (US equities, commodities, FX, Korea, Hong Kong, China) is open, in pre/post-market, overnight or closed, with the time left in that state.
 - **Footer (liquidation flow):** two lines, shorts liquidated above (green) and longs liquidated below (red), in USD notional.
   - Rolling totals over 1 minute, 5 minutes and 1 hour.
@@ -153,7 +155,7 @@ Neither is on the WebSocket streams, so a background thread fetches them over RE
 
 ## Data sources
 
-One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s`, `!forceOrder@arr` and `tradingSession`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls. The USDC/USDT line uses a second connection, to `wss://stream.binance.com:9443/ws/usdcusdt@bookTicker`, which reconnects on its own.
+One combined connection to `wss://fstream.binance.com/market/stream` carrying `!ticker@arr`, `!markPrice@arr@1s`, `!forceOrder@arr` and `tradingSession`. TradFi contracts are identified from the mark-price stream, where Binance sends them as a separate batch. It reconnects automatically with backoff if the connection drops or stalls. The spot lines and the BTC markets table use a second connection, to `wss://stream.binance.com:9443/ws/!ticker_1d@arr`, which reconnects on its own.
 
 This project is not affiliated with Binance. Nothing here is financial advice.
 

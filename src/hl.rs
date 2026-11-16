@@ -180,7 +180,19 @@ impl App {
         // SYMBOL BIN/yr% HL/yr% SPREAD TRADE BASIS% then liquidity on both sides
         const TW: usize = 99;
         let s = &mut lines[0];
-        let _ = write!(s, "\x1b[0;1m FUNDING ARBITRAGE\x1b[0m  Binance vs Hyperliquid, annualised | {} pairs | sort {}", vals.len(), ARB_SORTS[self.arb_sort]);
+        // rows a page holds, when the table fits at all
+        let page_len = if nl >= 5 && w >= TW { ((w + 2) / (TW + 2)).max(1) * (nl - 3) } else { 1 };
+        let pages = vals.len().div_ceil(page_len).max(1);
+        self.arb_page = self.arb_page.min(pages - 1);
+        let first = self.arb_page * page_len;
+        let _ = write!(
+            s,
+            "\x1b[0;1m FUNDING ARBITRAGE\x1b[0m  Binance vs Hyperliquid, annualised | {} pairs | sort {} | pg {}/{}",
+            vals.len(),
+            ARB_SORTS[self.arb_sort],
+            self.arb_page + 1,
+            pages
+        );
         match (self.hl_at, self.hl_err.is_empty()) {
             (Some(t), true) => {
                 let _ = write!(s, "\x1b[2m | Hyperliquid {}s ago\x1b[0m", t.elapsed().as_secs());
@@ -207,7 +219,7 @@ impl App {
                 );
             }
             s.extend_from_slice(b"\x1b[0m");
-            for (k, &(sp, i)) in vals.iter().take(cols * per).enumerate() {
+            for (k, &(sp, i)) in vals.iter().skip(first).take(cols * per).enumerate() {
                 let r = &self.rows[i as usize];
                 let s = &mut lines[2 + k % per];
                 // rows of a later table column start where the previous one ended
@@ -243,11 +255,11 @@ impl App {
                     s.extend_from_slice(b"  ");
                 }
             }
-            let more = vals.len().saturating_sub(cols * per);
+            let more = vals.len().saturating_sub(first + cols * per);
             let s = &mut lines[nl - 1];
-            s.extend_from_slice(b"\x1b[0;2m A/esc board | s sort | m t / filters apply | SPREAD = Binance - Hyperliquid, % a year | BASIS = HL mark vs Binance mark");
+            s.extend_from_slice(b"\x1b[0;2m A/esc board | s sort | arrows/j/k page | m t / filters apply | SPREAD = Binance - Hyperliquid, % a year | BASIS = HL mark vs Binance mark");
             if more > 0 {
-                let _ = write!(s, " | {} more below, filter with /", more);
+                let _ = write!(s, " | {} more below", more);
             }
             s.extend_from_slice(b"\x1b[0m");
         } else {
